@@ -1,0 +1,128 @@
+// ------------------------------------------------------------------------------
+// Copyright (c) 2026 autumo GmbH. All rights reserved.
+//
+// Licensed under the GNU Affero General Public License v3.0 (AGPLv3).
+// See LICENSE file in the project root for full license information.
+//
+// This file is part of jip. jip is free software: you can redistribute
+// it and/or modify it under the terms of the GNU Affero General Public License
+// as published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+// ------------------------------------------------------------------------------
+
+// =============================================================================
+//  jip — `jip run`
+//  ---------------------------------------------------------------------------
+//  The flagship command.  Makes sure every dependency is available, builds
+//  the classpath from `jip.lock`, and starts the program with the system
+//  JDK.  Runs a single `.java` file directly, starts `.jar` files via their
+//  `Main-Class`, and compiles multi-file projects first when needed.
+//
+//  This is what makes "clone a project, run it" possible.
+//
+//  Project:   jip
+//  Author:    autumo GmbH
+//  Date:      2026-08-15
+// =============================================================================
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use anyhow::{Context, bail};
+
+use crate::commands::build::{self, MainTarget};
+use crate::commands::{check_java_version, classpath_for, classpath_string, load_config};
+use crate::convert::{self, ConversionOffer};
+
+/// Run the project's main class with all dependencies on the classpath.
+pub fn run(
+    client: &reqwest::blocking::Client,
+    main_arg: Option<&str>,
+    program_args: &[String],
+) -> anyhow::Result<()> {
+    // Offer to convert a detected Maven/Gradle project when jip.toml is
+    // missing, so `jip run` works right after cloning a foreign repo.
+    let config = match convert::offer_conversion(client)? {
+        ConversionOffer::Converted(config) => config,
+        ConversionOffer::Declined => return Ok(()),
+        ConversionOffer::Proceed => load_config()?,
+    };
+
+    // Lazily download every jar that is not yet cached.
+    let classpath = classpath_for(client, &config)?;
+
+    check_java_version(config.project.java.as_deref())?;
+
+    let target = match build::main_target(&config, main_arg)? {
+        Some(target) => target,
+        None => bail!(
+            "no main class found — write a class with `public static void main` \
+             under {} or set [project] main in jip.toml",
+            build::source_dir(&config).display()
+        ),
+    };
+
+    let mut command = Command::new("java");
+    match target {
+        MainTarget::SourceFile(path) => {
+            if !path.exists() {
+                bail!("cannot find {}", path.display());
+            }
+            command
+                .arg("--class-path")
+                .arg(classpath_string(&classpath))
+                .arg(&path);
+        }
+        MainTarget::Jar(path) => {
+            if !path.exists() {
+                bail!("cannot find {}", path.display());
+            }
+            let main_class = main_class_from_jar(&path)?;
+            let mut classpath = classpath;
+            classpath.push(path);
+            command
+                .arg("--class-path")
+                .arg(classpath_string(&classpath))
+                .arg(&main_class);
+        }
+        MainTarget::Class(name) => {
+            build::compile(&config, &classpath)?;
+            let mut run_classpath = vec![PathBuf::from(build::CLASSES_DIR)];
+            run_classpath.extend(classpath);
+            command
+                .arg("--class-path")
+                .arg(classpath_string(&run_classpath))
+                .arg(&name);
+        }
+    }
+    command.args(program_args);
+
+    // Hand over to the child process: same output, same exit code.
+    let status = command.status().context("failed to start `java`")?;
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    Ok(())
+}
+
+/// Read the `Main-Class` entry from a jar's manifest.
+fn main_class_from_jar(path: &Path) -> anyhow::Result<String> {
+    let file =
+        std::fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+    let mut archive = zip::ZipArchive::new(file).context("invalid jar file")?;
+    let mut manifest = archive
+        .by_name("META-INF/MANIFEST.MF")
+        .with_context(|| format!("{} has no META-INF/MANIFEST.MF", path.display()))?;
+    let mut content = String::new();
+    std::io::Read::read_to_string(&mut manifest, &mut content)?;
+
+    for line in content.lines() {
+        if let Some(value) = line.trim().strip_prefix("Main-Class:") {
+            let main_class = value.trim();
+            if !main_class.is_empty() {
+                return Ok(main_class.to_string());
+            }
+        }
+    }
+    bail!("no Main-Class entry found in {}", path.display())
+}

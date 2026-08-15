@@ -1,0 +1,125 @@
+# ------------------------------------------------------------------------------
+# Copyright (c) 2026 autumo GmbH. All rights reserved.
+#
+# Licensed under the GNU Affero General Public License v3.0 (AGPLv3).
+# See LICENSE file in the project root for full license information.
+#
+# This file is part of jip. jip is free software: you can redistribute
+# it and/or modify it under the terms of the GNU Affero General Public License
+# as published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+# ------------------------------------------------------------------------------
+
+# =============================================================================
+#  jip — Release
+#  ---------------------------------------------------------------------------
+#  Runs only when a version tag is pushed, which `bin/release.sh` does.
+#  Cross-compiles the binaries for every supported platform, uploads them
+#  as artifacts, and creates a GitHub Release with them attached as assets.
+#
+#  Project:   jip
+#  Author:    autumo GmbH
+#  Date:      2026-08-16
+# =============================================================================
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  # Cross-compile every supported target into a release binary.
+  build:
+    name: cross-compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cross-compiler
+        run: |
+          cargo install cargo-zigbuild
+          rustup target add \
+            x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
+            x86_64-pc-windows-gnu \
+            x86_64-apple-darwin aarch64-apple-darwin
+      - name: Build all targets
+        run: |
+          for target in \
+            x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
+            x86_64-pc-windows-gnu \
+            x86_64-apple-darwin aarch64-apple-darwin
+          do
+            cargo zigbuild --release --target "$target"
+          done
+      - name: Collect binaries
+        run: |
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-gnu/release/jip    dist/jip-linux-x86_64
+          cp target/aarch64-unknown-linux-gnu/release/jip   dist/jip-linux-aarch64
+          cp target/x86_64-pc-windows-gnu/release/jip.exe   dist/jip-windows-x86_64.exe
+          cp target/x86_64-apple-darwin/release/jip         dist/jip-macos-x86_64
+          cp target/aarch64-apple-darwin/release/jip        dist/jip-macos-aarch64
+          ls -la dist
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: jip-binaries
+          path: dist/*
+
+  # Create the GitHub Release once every binary is built.
+  release:
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Extract changelog section
+        env:
+          VERSION: "${{ github.ref_name }}"
+        run: |
+          VERSION="${VERSION#v}"
+          python - <<'EOF'
+          import os
+          import re
+
+          version = os.environ["VERSION"]
+          try:
+              text = open("CHANGELOG.md").read()
+          except FileNotFoundError:
+              text = ""
+
+          m = re.search(
+              rf"^## \[{re.escape(version)}\].*?(?=^## \[|\Z)",
+              text, re.M | re.S,
+          )
+          notes = m.group(0) if m else ""
+          if not notes:
+              print(f"::warning::No changelog section found for version {version}")
+          open("/tmp/notes.md", "w").write(notes)
+          EOF
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [ -s /tmp/notes.md ]; then
+            gh release create "${GITHUB_REF_NAME}" \
+              artifacts/*/* \
+              --title "jip ${VERSION}" \
+              --notes-file /tmp/notes.md
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              artifacts/*/* \
+              --title "jip ${VERSION}" \
+              --generate-notes
+          fi

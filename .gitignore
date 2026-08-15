@@ -1,0 +1,19 @@
+# Rust build output
+/target
+
+# macOS
+.DS_Store
+
+# Editors and IDEs
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# jip caches
+.jip/
