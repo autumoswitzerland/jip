@@ -24,40 +24,46 @@
 //  Date:      2026-08-15
 // =============================================================================
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, bail};
 
 use crate::central;
-use crate::commands::{require_config, resolve, resolve_tests, write_lock};
+use crate::commands::{
+    repositories_for, require_config, resolve, resolve_provided, resolve_tests, write_lock,
+};
 use crate::config::CONFIG_FILE;
 use crate::lock::LOCK_FILE;
 
 /// Add a dependency and re-resolve.
-pub fn run(client: &reqwest::blocking::Client, dependency: &str, test: bool) -> anyhow::Result<()> {
+pub fn run(
+    client: &reqwest::blocking::Client,
+    dependency: &str,
+    test: bool,
+    provided: bool,
+) -> anyhow::Result<()> {
     let mut config = require_config()?;
 
     let (key, group, artifact) = parse_dependency_arg(dependency)?;
-    let section = if test {
-        "test-dependencies"
+    let repos = repositories_for(&config);
+    let (section, target): (&str, &mut BTreeMap<String, String>) = if provided {
+        ("provided-dependencies", &mut config.provided_dependencies)
+    } else if test {
+        ("test-dependencies", &mut config.test_dependencies)
     } else {
-        "dependencies"
-    };
-    let target = if test {
-        &mut config.test_dependencies
-    } else {
-        &mut config.dependencies
+        ("dependencies", &mut config.dependencies)
     };
     if target.contains_key(&key) {
         println!("{key} is already in [{section}] in {CONFIG_FILE}");
         return Ok(());
     }
 
-    // Without an explicit version, ask Maven Central for the latest one.
+    // Without an explicit version, ask the repositories for the latest one.
     let version = match parse_explicit_version(dependency) {
         Some(version) => version.to_string(),
         None => {
-            let latest = central::latest_version(client, group, artifact)?
+            let latest = central::latest_version(client, &repos, group, artifact)?
                 .with_context(|| format!("no version found for {key} on Maven Central"))?;
             println!("latest version of {key} is {latest}");
             latest
@@ -67,13 +73,17 @@ pub fn run(client: &reqwest::blocking::Client, dependency: &str, test: bool) -> 
     target.insert(key.clone(), version.clone());
 
     let resolution = resolve(client, &config)?;
+    let provided = resolve_provided(client, &config)?;
     let tests = resolve_tests(client, &config)?;
-    write_lock(&resolution.flat, &tests.flat)?;
+    write_lock(&resolution.flat, &provided.flat, &tests.flat)?;
     config.save(Path::new(CONFIG_FILE))?;
 
     println!(
-        "added {key}:{version} — {} packages in {LOCK_FILE}",
-        resolution.flat.len()
+        "{}",
+        crate::console::green(&format!(
+            "added {key}:{version} — {} packages in {LOCK_FILE}",
+            resolution.flat.len()
+        ))
     );
     Ok(())
 }

@@ -65,6 +65,12 @@ pub struct Pom {
     pub managed_dependencies: Vec<PomDependency>,
     /// The artifact's own dependencies.
     pub dependencies: Vec<PomDependency>,
+    /// Custom `<repositories>` as `(id, url)` pairs.
+    pub repositories: Vec<(String, String)>,
+    /// Java version from the `maven-compiler-plugin` `<release>` config.
+    pub compiler_release: Option<String>,
+    /// Java version from the `maven-compiler-plugin` `<source>` config.
+    pub compiler_source: Option<String>,
 }
 
 /// Parse POM XML into a [`Pom`] structure.
@@ -109,6 +115,23 @@ pub fn parse_pom(xml: &str) -> anyhow::Result<Pom> {
         .map(parse_dependency_list)
         .unwrap_or_default();
 
+    let repositories = child(project, "repositories")
+        .map(|repos| {
+            repos
+                .children()
+                .filter(|n| n.is_element() && n.tag_name().name() == "repository")
+                .filter_map(|repo| {
+                    Some((
+                        text_of(repo, "id")?.to_string(),
+                        text_of(repo, "url")?.to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let (compiler_release, compiler_source) = compiler_plugin_java(child(project, "build"));
+
     Ok(Pom {
         group_id: text_of(project, "groupId").map(str::to_string),
         artifact_id: text_of(project, "artifactId").map(str::to_string),
@@ -117,7 +140,37 @@ pub fn parse_pom(xml: &str) -> anyhow::Result<Pom> {
         properties,
         managed_dependencies,
         dependencies,
+        repositories,
+        compiler_release,
+        compiler_source,
     })
+}
+
+/// Read the `maven-compiler-plugin` `<release>` and `<source>` values from a
+/// `<build>` element, when that plugin is configured.
+fn compiler_plugin_java(
+    build: Option<roxmltree::Node<'_, '_>>,
+) -> (Option<String>, Option<String>) {
+    let Some(plugins) = build.and_then(|b| child(b, "plugins")) else {
+        return (None, None);
+    };
+    for plugin in plugins
+        .children()
+        .filter(|n| n.is_element() && n.tag_name().name() == "plugin")
+    {
+        if text_of(plugin, "artifactId") == Some("maven-compiler-plugin") {
+            let config = child(plugin, "configuration");
+            return (
+                config
+                    .and_then(|c| text_of(c, "release"))
+                    .map(str::to_string),
+                config
+                    .and_then(|c| text_of(c, "source"))
+                    .map(str::to_string),
+            );
+        }
+    }
+    (None, None)
 }
 
 /// Return the first child element with the given local tag name.

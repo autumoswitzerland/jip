@@ -37,13 +37,17 @@ use crate::artifact::Artifact;
 pub const LOCK_FILE: &str = "jip.lock";
 
 /// Format version of the lock file.  Bump it when the format changes.
-const LOCK_FORMAT_VERSION: u32 = 2;
+const LOCK_FORMAT_VERSION: u32 = 3;
 
 /// The lock file content.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LockFile {
     pub version: u32,
     pub packages: Vec<LockedPackage>,
+    /// Compile-only packages (Maven `provided` scope / Gradle `compileOnly`),
+    /// pinned for `javac` but never on the runtime classpath.
+    #[serde(default)]
+    pub provided_packages: Vec<LockedPackage>,
     /// Test-scoped packages, only used on the `jip test` classpath.
     #[serde(default)]
     pub test_packages: Vec<LockedPackage>,
@@ -92,17 +96,25 @@ impl LockFile {
         fs::write(path, raw).with_context(|| format!("cannot write {}", path.display()))
     }
 
-    /// Build a lock file from flat artifact lists (runtime and test),
-    /// sorted and de-duplicated.  Test packages that are already pinned as
-    /// runtime packages are not repeated in the test section.
-    pub fn from_artifacts(artifacts: Vec<Artifact>, test_artifacts: Vec<Artifact>) -> Self {
+    /// Build a lock file from flat artifact lists (runtime, compile-only and
+    /// test), sorted and de-duplicated.  Compile-only and test packages that
+    /// are already pinned as runtime packages are not repeated in their
+    /// sections.
+    pub fn from_artifacts(
+        artifacts: Vec<Artifact>,
+        provided_artifacts: Vec<Artifact>,
+        test_artifacts: Vec<Artifact>,
+    ) -> Self {
         let packages = dedupe(artifacts);
-        let mut test_packages = dedupe(test_artifacts);
         let runtime_keys: HashSet<String> = packages.iter().map(|package| package.key()).collect();
+        let mut provided_packages = dedupe(provided_artifacts);
+        let mut test_packages = dedupe(test_artifacts);
+        provided_packages.retain(|package| !runtime_keys.contains(&package.key()));
         test_packages.retain(|package| !runtime_keys.contains(&package.key()));
         Self {
             version: LOCK_FORMAT_VERSION,
             packages,
+            provided_packages,
             test_packages,
         }
     }
@@ -119,4 +131,46 @@ fn dedupe(artifacts: Vec<Artifact>) -> Vec<LockedPackage> {
         });
     }
     seen.into_values().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn artifact(group: &str, artifact: &str, version: &str) -> Artifact {
+        Artifact {
+            group: group.to_string(),
+            artifact: artifact.to_string(),
+            version: version.to_string(),
+        }
+    }
+
+    #[test]
+    fn provided_and_test_packages_not_repeated_in_runtime() {
+        let lock = LockFile::from_artifacts(
+            vec![artifact("com.example", "runtime-dep", "1.0")],
+            vec![artifact("jakarta.servlet", "jakarta.servlet-api", "6.1.0")],
+            vec![artifact("junit", "junit", "4.13.2")],
+        );
+        assert_eq!(lock.version, 3);
+        assert_eq!(lock.packages.len(), 1);
+        assert_eq!(lock.provided_packages.len(), 1);
+        assert_eq!(lock.test_packages.len(), 1);
+        assert_eq!(
+            lock.provided_packages[0].key(),
+            "jakarta.servlet:jakarta.servlet-api"
+        );
+    }
+
+    #[test]
+    fn runtime_dependency_never_repeated_in_provided_or_test() {
+        let lock = LockFile::from_artifacts(
+            vec![artifact("com.example", "shared", "1.0")],
+            vec![artifact("com.example", "shared", "1.0")],
+            vec![artifact("com.example", "shared", "1.0")],
+        );
+        assert_eq!(lock.packages.len(), 1);
+        assert!(lock.provided_packages.is_empty());
+        assert!(lock.test_packages.is_empty());
+    }
 }

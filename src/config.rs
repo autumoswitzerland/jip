@@ -27,8 +27,18 @@
 //      [cache]
 //      use-m2 = true      # reuse jars from ~/.m2 when present
 //
+//      [classpath]        # optional: extra classpath entries
+//      extra = ["web", "lib/foo.jar"]   # runtime + test (dirs or jars)
+//      test-extra = ["src/test/resources"]  # only for `jip test`
+//
+//      [repositories]     # optional: extra repositories to fetch from
+//      "local-repo" = "file:///srv/jars/lib/repo"   # tried before Maven Central
+//
 //      [dependencies]
 //      com.google.guava = "33.0.0-jre"
+//
+//      [provided-dependencies]   # compile-only (Maven `provided`)
+//      jakarta.servlet = "6.1.0"
 //
 //      [test-dependencies]   # only used by `jip test`
 //      "org.junit.platform:junit-platform-console-standalone" = "1.13.0-M3"
@@ -57,8 +67,26 @@ pub struct ProjectConfig {
     pub project: ProjectSettings,
     #[serde(default)]
     pub cache: CacheSettings,
+    /// Extra classpath entries beyond the resolved dependency jars.
+    #[serde(default, skip_serializing_if = "ClasspathSettings::is_empty")]
+    pub classpath: ClasspathSettings,
+    /// Extra repositories to fetch dependencies from, tried in (key) order
+    /// before Maven Central.  Keys are arbitrary names; values are repository
+    /// base URLs, either `https://...` or `file://...` for a local folder.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub repositories: BTreeMap<String, String>,
     #[serde(default)]
     pub dependencies: BTreeMap<String, String>,
+    /// Dependencies required to compile but never needed at runtime, from
+    /// Maven's `provided` scope or Gradle's `compileOnly`.  They go on the
+    /// `javac` classpath of `jip build`/`run`/`test`, never on the classpath
+    /// of the running program.
+    #[serde(
+        default,
+        rename = "provided-dependencies",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub provided_dependencies: BTreeMap<String, String>,
     /// Dependencies that are only used by `jip test` and never leak onto
     /// the runtime classpath (`jip run`/`jip build`).
     #[serde(default, rename = "test-dependencies")]
@@ -90,6 +118,25 @@ pub struct CacheSettings {
     pub use_m2: bool,
 }
 
+/// Extra classpath entries, for resources or jars that are not on any
+/// repository.  Paths are relative to the project root.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ClasspathSettings {
+    /// Directories (resources, extra class folders) or `.jar` files added
+    /// to the runtime classpath of `jip build`, `jip run`, and `jip test`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra: Vec<String>,
+    /// Directories or `.jar` files added only to the `jip test` classpath.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "test-extra")]
+    pub test_extra: Vec<String>,
+}
+
+impl ClasspathSettings {
+    fn is_empty(&self) -> bool {
+        self.extra.is_empty() && self.test_extra.is_empty()
+    }
+}
+
 impl ProjectConfig {
     /// Load the configuration from `path`, or return a fresh default config
     /// when the file does not exist yet.
@@ -116,8 +163,69 @@ impl ProjectConfig {
         Self {
             project: ProjectSettings::default(),
             cache: CacheSettings::default(),
+            classpath: ClasspathSettings::default(),
+            repositories: BTreeMap::new(),
             dependencies: BTreeMap::new(),
+            provided_dependencies: BTreeMap::new(),
             test_dependencies: BTreeMap::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classpath_settings_round_trip() {
+        let raw = r#"
+            [project]
+            name = "demo"
+
+            [classpath]
+            extra = ["web", "lib/foo.jar"]
+            test-extra = ["src/test/resources"]
+        "#;
+        let config: ProjectConfig = toml::from_str(raw).unwrap();
+        assert_eq!(config.classpath.extra, vec!["web", "lib/foo.jar"]);
+        assert_eq!(config.classpath.test_extra, vec!["src/test/resources"]);
+        let saved = toml::to_string_pretty(&config).unwrap();
+        assert!(saved.contains("extra = ["));
+        assert!(saved.contains("test-extra = ["));
+    }
+
+    #[test]
+    fn empty_classpath_section_is_omitted() {
+        let config = ProjectConfig::default_config();
+        let saved = toml::to_string_pretty(&config).unwrap();
+        assert!(!saved.contains("[classpath]"));
+    }
+
+    #[test]
+    fn provided_dependencies_round_trip() {
+        let raw = r#"
+            [project]
+            name = "demo"
+
+            [provided-dependencies]
+            "jakarta.servlet:jakarta.servlet-api" = "6.1.0"
+        "#;
+        let config: ProjectConfig = toml::from_str(raw).unwrap();
+        assert_eq!(
+            config
+                .provided_dependencies
+                .get("jakarta.servlet:jakarta.servlet-api")
+                .unwrap(),
+            "6.1.0"
+        );
+        let saved = toml::to_string_pretty(&config).unwrap();
+        assert!(saved.contains("provided-dependencies"));
+    }
+
+    #[test]
+    fn empty_provided_dependencies_are_omitted() {
+        let config = ProjectConfig::default_config();
+        let saved = toml::to_string_pretty(&config).unwrap();
+        assert!(!saved.contains("provided-dependencies"));
     }
 }

@@ -28,6 +28,7 @@
 // =============================================================================
 
 use std::fs;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -35,7 +36,7 @@ use std::sync::OnceLock;
 use anyhow::{Context, bail};
 use regex::Regex;
 
-use crate::commands::{check_java_version, classpath_for, classpath_string, load_config};
+use crate::commands::{check_java_version, classpath_string, compile_classpath_for, load_config};
 use crate::config::ProjectConfig;
 use crate::convert::{self, ConversionOffer};
 
@@ -55,14 +56,24 @@ pub enum MainTarget {
     Class(String),
 }
 
+/// The outcome of resolving what `jip run` should start.
+pub enum MainDecision {
+    /// A concrete run target was found.
+    Run(MainTarget),
+    /// Several classes with a `main` method exist; the user should pick one.
+    Multiple(Vec<String>),
+    /// Nothing runnable could be found.
+    None,
+}
+
 /// The `jip build` command: compile everything, unless already up to date.
 pub fn run(client: &reqwest::blocking::Client) -> anyhow::Result<()> {
     let config = match convert::offer_conversion(client)? {
         ConversionOffer::Converted(config) => config,
         ConversionOffer::Declined => return Ok(()),
-        ConversionOffer::Proceed => load_config()?,
+        ConversionOffer::Proceed => Box::new(load_config()?),
     };
-    let classpath = classpath_for(client, &config)?;
+    let classpath = compile_classpath_for(client, &config)?;
     check_java_version(config.project.java.as_deref())?;
     compile(&config, &classpath)
 }
@@ -94,9 +105,12 @@ pub fn compile_java(
 ) -> anyhow::Result<()> {
     if is_up_to_date(sources, out_dir, extra_inputs)? {
         println!(
-            "up to date — {} source files in {}",
-            sources.len(),
-            out_dir.display()
+            "{}",
+            crate::console::green(&format!(
+                "up to date — {} source files in {}",
+                sources.len(),
+                out_dir.display()
+            ))
         );
         return Ok(());
     }
@@ -114,9 +128,12 @@ pub fn compile_java(
         std::process::exit(status.code().unwrap_or(1));
     }
     println!(
-        "compiled {} source files -> {}",
-        sources.len(),
-        out_dir.display()
+        "{}",
+        crate::console::green(&format!(
+            "compiled {} source files -> {}",
+            sources.len(),
+            out_dir.display()
+        ))
     );
     Ok(())
 }
@@ -134,20 +151,36 @@ pub fn source_dir(config: &ProjectConfig) -> PathBuf {
 /// Decide what `jip run` starts.  Explicit arguments and `[project] main`
 /// win; otherwise the class with a `main` method is detected, falling back
 /// to a single root-level `.java` file.
-///
-/// Returns `None` when nothing runnable could be found.
-pub fn main_target(
-    config: &ProjectConfig,
-    arg: Option<&str>,
-) -> anyhow::Result<Option<MainTarget>> {
+pub fn resolve_main(config: &ProjectConfig, arg: Option<&str>) -> anyhow::Result<MainDecision> {
     if let Some(arg) = arg {
-        return Ok(Some(classify(arg)));
+        return Ok(MainDecision::Run(classify(arg)));
     }
     if let Some(main) = &config.project.main {
-        return Ok(Some(classify(main)));
+        return Ok(MainDecision::Run(classify(main)));
     }
 
-    let candidates: Vec<String> = collect_java_files(&source_dir(config))
+    let candidates = main_candidates(config)?;
+    if candidates.len() > 1 {
+        return Ok(MainDecision::Multiple(candidates));
+    }
+    if let Some(fqcn) = candidates.into_iter().next() {
+        return Ok(MainDecision::Run(MainTarget::Class(fqcn)));
+    }
+
+    // Fall back to a single `.java` file in the project root.
+    let root_files = root_java_files();
+    if root_files.len() == 1 {
+        return Ok(MainDecision::Run(MainTarget::SourceFile(
+            root_files[0].clone(),
+        )));
+    }
+    Ok(MainDecision::None)
+}
+
+/// The fully qualified names of every class with a `public static void main`
+/// method under the project's source directory, sorted for stable ordering.
+pub fn main_candidates(config: &ProjectConfig) -> anyhow::Result<Vec<String>> {
+    let mut candidates: Vec<String> = collect_java_files(&source_dir(config))
         .into_iter()
         .filter(|path| {
             fs::read_to_string(path)
@@ -156,22 +189,78 @@ pub fn main_target(
         })
         .map(|path| fqcn_of(&path))
         .collect::<anyhow::Result<_>>()?;
-    if candidates.len() > 1 {
-        bail!(
-            "multiple classes with a `main` method: {} — set [project] main",
-            candidates.join(", ")
-        );
+    candidates.sort();
+    Ok(candidates)
+}
+
+/// The error message for an ambiguous `main` class, with one candidate per
+/// line.  Also used for the list shown by the interactive picker.
+pub fn multiple_main_error(candidates: &[String]) -> String {
+    let listed: Vec<String> = candidates
+        .iter()
+        .map(|fqcn| format!("  - {fqcn}"))
+        .collect();
+    format!(
+        "multiple classes with a `main` method found:\n{}\nset [project] main to pick one",
+        listed.join("\n")
+    )
+}
+
+/// Is `arg` a main class of this project: an existing `.java`/`.jar` file,
+/// the configured `[project] main`, or a class with a detected `main` method?
+///
+/// Everything else passed to `jip run` is a program argument, so
+/// `jip run start` runs the configured main class with `start` as its first
+/// argument instead of trying to load a class named `start`.
+pub fn is_main_class(config: &ProjectConfig, arg: &str) -> bool {
+    let path = Path::new(arg);
+    if path.extension().is_some_and(|e| e == "java" || e == "jar") {
+        return true;
     }
-    if let Some(fqcn) = candidates.into_iter().next() {
-        return Ok(Some(MainTarget::Class(fqcn)));
+    if matches!(config.project.main.as_deref(), Some(main) if main == arg) {
+        return true;
+    }
+    main_candidates(config)
+        .unwrap_or_default()
+        .iter()
+        .any(|candidate| candidate == arg)
+}
+
+/// Let the user pick one of several `main` classes by number.
+///
+/// Interactive only: without a terminal the ambiguity is reported as an
+/// error so CI runs never hang on a prompt.
+pub fn choose_main(candidates: &[String]) -> anyhow::Result<MainTarget> {
+    if !std::io::stdin().is_terminal() {
+        bail!("{}", multiple_main_error(candidates));
     }
 
-    // Fall back to a single `.java` file in the project root.
-    let root_files = root_java_files();
-    if root_files.len() == 1 {
-        return Ok(Some(MainTarget::SourceFile(root_files[0].clone())));
+    println!("multiple classes with a `main` method found — pick one:");
+    for (index, fqcn) in candidates.iter().enumerate() {
+        println!("  {}. {fqcn}", index + 1);
     }
-    Ok(None)
+    let stdin = std::io::stdin();
+    loop {
+        print!("  select 1-{} (q to quit): ", candidates.len());
+        std::io::stdout().flush().context("cannot write prompt")?;
+        let mut answer = String::new();
+        if stdin
+            .read_line(&mut answer)
+            .context("cannot read selection")?
+            == 0
+        {
+            bail!("no main class selected — set [project] main in jip.toml");
+        }
+        let answer = answer.trim();
+        if answer.eq_ignore_ascii_case("q") {
+            bail!("no main class selected — set [project] main in jip.toml");
+        }
+        if let Ok(index) = answer.parse::<usize>()
+            && let Some(fqcn) = candidates.get(index.wrapping_sub(1))
+        {
+            return Ok(MainTarget::Class(fqcn.clone()));
+        }
+    }
 }
 
 /// Turn a `main` value into a run target: `.java`/`.jar` are files,
@@ -358,5 +447,16 @@ mod tests {
         let mut config = ProjectConfig::default_config();
         config.project.source = Some("src/java".to_string());
         assert_eq!(source_dir(&config), Path::new("src/java"));
+    }
+
+    #[test]
+    fn recognizes_main_classes() {
+        let mut config = ProjectConfig::default_config();
+        config.project.main = Some("com.example.Main".to_string());
+
+        assert!(is_main_class(&config, "com.example.Main"));
+        assert!(is_main_class(&config, "Main.java"));
+        assert!(is_main_class(&config, "app.jar"));
+        assert!(!is_main_class(&config, "start"));
     }
 }

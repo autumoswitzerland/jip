@@ -47,6 +47,9 @@ pub enum Command {
         /// Add to `[test-dependencies]` instead of `[dependencies]`.
         #[arg(long)]
         test: bool,
+        /// Add to `[provided-dependencies]` (compile-only) instead of `[dependencies]`.
+        #[arg(long, conflicts_with = "test")]
+        provided: bool,
     },
 
     /// Remove a dependency from `jip.toml`.
@@ -56,6 +59,9 @@ pub enum Command {
         /// Remove from `[test-dependencies]` instead of `[dependencies]`.
         #[arg(long)]
         test: bool,
+        /// Remove from `[provided-dependencies]` (compile-only) instead of `[dependencies]`.
+        #[arg(long, conflicts_with = "test")]
+        provided: bool,
     },
 
     /// Resolve all dependencies, download missing jars, and write `jip.lock`.
@@ -81,10 +87,18 @@ pub enum Command {
     /// `.java` file (started directly), or a `.jar`.  Without an argument,
     /// the `main` value from `jip.toml` is used, or a class with a
     /// `public static void main` method is detected automatically.
+    ///
+    /// Everything else is passed to the program: `jip run start` runs
+    /// `[project] main` with `start` as its first argument.  Use `--` before
+    /// arguments that start with a hyphen: `jip run -- -h`.
     Run {
         /// Main class or file (.java/.jar).  Defaults to `main` in
         /// `jip.toml`, or auto-detection.
         main: Option<String>,
+
+        /// JVM system property, `NAME=VALUE` (repeatable, passed to `java`).
+        #[arg(short = 'D', long = "define", value_name = "NAME=VALUE")]
+        defines: Vec<String>,
 
         /// Arguments passed through to the program.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]

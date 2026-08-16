@@ -32,7 +32,7 @@
 
 use std::fs;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use sha1::{Digest, Sha1};
@@ -90,32 +90,48 @@ impl Cache {
 
     /// Make sure the jar for `artifact` is available locally, downloading it
     /// (and verifying its SHA-1 checksum) when it is missing.
-    pub fn ensure_jar(&self, artifact: &Artifact, repo_url: &str) -> anyhow::Result<PathBuf> {
+    ///
+    /// `repos` are tried in order; the first repository that has the jar wins.
+    pub fn ensure_jar(&self, artifact: &Artifact, repos: &[String]) -> anyhow::Result<PathBuf> {
         if let Some(path) = self.existing_jar(artifact) {
             return Ok(path);
         }
-        self.download_jar(artifact, repo_url)
+        self.download_jar(artifact, repos)
     }
 
     /// Download a jar into the cache, verifying the SHA-1 checksum.
-    fn download_jar(&self, artifact: &Artifact, repo_url: &str) -> anyhow::Result<PathBuf> {
-        let dest = self.cache_jar_path(artifact);
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("cannot create {}", parent.display()))?;
+    fn download_jar(&self, artifact: &Artifact, repos: &[String]) -> anyhow::Result<PathBuf> {
+        let mut tried = Vec::new();
+        for repo in repos {
+            match self.try_download(artifact, repo) {
+                Ok(dest) => return Ok(dest),
+                Err(err) => tried.push(format!("  {repo}: {err}")),
+            }
+        }
+        bail!(
+            "cannot download {} from any repository:\n{}",
+            artifact.jar_file_name(),
+            tried.join("\n")
+        )
+    }
+
+    /// Download one jar from a single repository, which may be an HTTP URL
+    /// or a `file://` path to a local Maven-style folder.
+    fn try_download(&self, artifact: &Artifact, repo: &str) -> anyhow::Result<PathBuf> {
+        let jar_path = format!("{}{}", artifact.directory(), artifact.jar_file_name());
+        if let Some(base_dir) = file_url_path(repo) {
+            ensure_repo_dir(&base_dir)?;
+            let src = base_dir.join(&jar_path);
+            let bytes = fs::read(&src)
+                .with_context(|| format!("jar not found in local repository {src:?}"))?;
+            let expected = fs::read_to_string(format!("{}.sha1", src.display())).ok();
+            let jar_url = format!("{repo}/{jar_path}");
+            return self.write_cached(artifact, &bytes, expected.as_deref(), &jar_url);
         }
 
-        let jar_url = format!(
-            "{repo_url}/{}{}",
-            artifact.directory(),
-            artifact.jar_file_name()
-        );
+        let jar_url = format!("{repo}/{jar_path}");
         println!("downloading {jar_url}");
-
-        // Download to a temporary file first, then rename into place.
-        // This way a half-written jar is never mistaken for a complete one.
-        let temp_path = dest.with_extension("jar.tmp");
-        let jar_bytes = self
+        let bytes = self
             .client
             .get(&jar_url)
             .send()
@@ -124,26 +140,57 @@ impl Cache {
             .with_context(|| format!("download failed: {jar_url}"))?
             .bytes()
             .context("reading jar response body")?;
-        fs::write(&temp_path, &jar_bytes)?;
+        let expected = self.fetch_sha1(&format!("{jar_url}.sha1"));
+        self.write_cached(artifact, &bytes, expected.as_deref(), &jar_url)
+    }
 
-        // Verify against the published SHA-1 when available.
-        let sha1_url = format!("{jar_url}.sha1");
-        match self.client.get(&sha1_url).send() {
-            Ok(response) if response.status().is_success() => {
-                let expected = response.text().context("reading checksum")?;
-                let actual = hex::encode(Sha1::digest(&jar_bytes));
+    /// Fetch a `.sha1` file from an HTTP repository, if published.
+    fn fetch_sha1(&self, url: &str) -> Option<String> {
+        match self.client.get(url).send() {
+            Ok(response) if response.status().is_success() => response.text().ok(),
+            _ => None,
+        }
+    }
+
+    /// Write verified jar bytes into the cache: a temporary file first, then
+    /// renamed into place so a half-written jar is never mistaken for a
+    /// complete one.
+    fn write_cached(
+        &self,
+        artifact: &Artifact,
+        bytes: &[u8],
+        expected: Option<&str>,
+        jar_url: &str,
+    ) -> anyhow::Result<PathBuf> {
+        let dest = self.cache_jar_path(artifact);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("cannot create {}", parent.display()))?;
+        }
+
+        let temp_path = dest.with_extension("jar.tmp");
+        fs::write(&temp_path, bytes)?;
+
+        match expected {
+            Some(expected) => {
+                let actual = hex::encode(Sha1::digest(bytes));
                 if !expected.trim().eq_ignore_ascii_case(&actual) {
                     let _ = fs::remove_file(&temp_path);
                     bail!(
-                        "checksum mismatch for {} (expected {}, got {})",
-                        jar_url,
+                        "checksum mismatch for {jar_url} (expected {}, got {})",
                         expected.trim(),
                         actual
                     );
                 }
             }
             // Some repositories do not publish checksums; warn but proceed.
-            _ => println!("warning: no SHA-1 checksum available for {jar_url}"),
+            // Local `file://` repositories are trusted and rarely carry
+            // checksums, so they do not warn.
+            None => {
+                if !jar_url.starts_with("file://") {
+                    crate::console::warn(&format!("no SHA-1 checksum available for {jar_url}"));
+                }
+            }
         }
 
         fs::rename(&temp_path, &dest)
@@ -190,6 +237,54 @@ pub fn download_text(client: &reqwest::blocking::Client, url: &str) -> anyhow::R
     Ok(text)
 }
 
+/// Read a text file (such as a POM) from a repository that may be an HTTP
+/// URL or a `file://` path to a local Maven-style folder.
+pub fn download_repo_text(
+    client: &reqwest::blocking::Client,
+    repo: &str,
+    relative_path: &str,
+) -> anyhow::Result<String> {
+    if let Some(base_dir) = file_url_path(repo) {
+        ensure_repo_dir(&base_dir)?;
+        let path = base_dir.join(relative_path);
+        return fs::read_to_string(&path)
+            .with_context(|| format!("file not found in local repository {path:?}"));
+    }
+    let url = format!("{repo}/{relative_path}");
+    download_text(client, &url)
+}
+
+/// Fail fast when a `file://` repository directory does not exist, so the
+/// resolution error names the real problem instead of a generic file lookup.
+fn ensure_repo_dir(base_dir: &Path) -> anyhow::Result<()> {
+    if base_dir.is_dir() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "local repository does not exist at {}",
+            base_dir.display()
+        ))
+    }
+}
+
+/// The filesystem path behind a `file://` URL, or `None` for HTTP URLs.
+pub(crate) fn file_url_path(repo: &str) -> Option<PathBuf> {
+    let rest = repo.strip_prefix("file://")?;
+    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    // `file:///C:/path` -> `C:/path` on Windows.
+    if cfg!(windows) {
+        let bytes = rest.as_bytes();
+        if rest.starts_with('/')
+            && rest.len() > 2
+            && bytes[1].is_ascii_alphabetic()
+            && bytes[2] == b':'
+        {
+            return Some(PathBuf::from(&rest[1..]));
+        }
+    }
+    Some(PathBuf::from(rest))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,5 +298,18 @@ mod tests {
                 .cache_jar_path(&artifact)
                 .ends_with("com/google/guava/guava/33.0.0-jre/guava-33.0.0-jre.jar")
         );
+    }
+
+    #[test]
+    fn parses_file_urls() {
+        assert_eq!(
+            file_url_path("file:///srv/repo"),
+            Some(PathBuf::from("/srv/repo"))
+        );
+        assert_eq!(
+            file_url_path("file://localhost/srv/repo"),
+            Some(PathBuf::from("/srv/repo"))
+        );
+        assert_eq!(file_url_path("https://repo1.maven.org/maven2"), None);
     }
 }

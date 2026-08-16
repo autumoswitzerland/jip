@@ -31,7 +31,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use anyhow::{Context, bail};
 
 use crate::artifact::Artifact;
-use crate::cache::download_text;
+use crate::cache::download_repo_text;
 use crate::config::ProjectConfig;
 use crate::pom::{Pom, is_runtime_dependency, parse_pom};
 
@@ -105,16 +105,17 @@ struct EffectiveContext {
 /// Fetches POMs from a repository and resolves the dependency graph.
 pub struct Resolver {
     client: reqwest::blocking::Client,
-    repo_url: String,
+    /// Repositories tried in order, Maven Central last.
+    repos: Vec<String>,
     /// POMs fetched during this run, keyed by `group:artifact:version`.
     pom_cache: HashMap<String, Pom>,
 }
 
 impl Resolver {
-    pub fn new(client: reqwest::blocking::Client, repo_url: &str) -> Self {
+    pub fn new(client: reqwest::blocking::Client, repos: &[String]) -> Self {
         Self {
             client,
-            repo_url: repo_url.to_string(),
+            repos: repos.to_vec(),
             pom_cache: HashMap::new(),
         }
     }
@@ -123,6 +124,15 @@ impl Resolver {
     /// classpath list plus a tree for display.
     pub fn resolve_project(&mut self, config: &ProjectConfig) -> anyhow::Result<Resolution> {
         self.resolve_dependencies(&config.dependencies)
+    }
+
+    /// Resolve the compile-only (`provided`) dependencies declared in
+    /// `config` the same way.
+    pub fn resolve_project_provided(
+        &mut self,
+        config: &ProjectConfig,
+    ) -> anyhow::Result<Resolution> {
+        self.resolve_dependencies(&config.provided_dependencies)
     }
 
     /// Resolve the test dependencies declared in `config` the same way.
@@ -377,16 +387,75 @@ impl Resolver {
         if self.pom_cache.contains_key(&key) {
             return Ok(());
         }
-        let url = format!(
-            "{}/{}{}",
-            self.repo_url,
-            artifact.directory(),
-            artifact.pom_file_name()
-        );
-        let xml = download_text(&self.client, &url)?;
-        let pom = parse_pom(&xml).with_context(|| format!("invalid POM at {url}"))?;
-        self.pom_cache.insert(key, pom);
-        Ok(())
+        let pom_path = format!("{}{}", artifact.directory(), artifact.pom_file_name());
+        let mut tried = Vec::new();
+        for repo in &self.repos {
+            match download_repo_text(&self.client, repo, &pom_path) {
+                Ok(xml) => {
+                    let pom = parse_pom(&xml)
+                        .with_context(|| format!("invalid POM at {repo}/{pom_path}"))?;
+                    self.pom_cache.insert(key, pom);
+                    return Ok(());
+                }
+                Err(err) => tried.push(format!("  {repo}: {err}")),
+            }
+        }
+        // Maven tolerates a missing POM when the jar is available: it warns
+        // "The POM for X is missing, no dependency information available"
+        // and keeps the artifact without transitive dependencies.  Mirror
+        // that so jar-only local repositories resolve.
+        if let Some(found_in) = self.jar_exists(artifact) {
+            crate::console::warn(&format!(
+                "POM for {key} is missing, no dependency information available — using {found_in}"
+            ));
+            self.pom_cache.insert(
+                key,
+                Pom {
+                    group_id: Some(artifact.group.clone()),
+                    artifact_id: Some(artifact.artifact.clone()),
+                    version: Some(artifact.version.clone()),
+                    parent: None,
+                    properties: HashMap::new(),
+                    managed_dependencies: Vec::new(),
+                    dependencies: Vec::new(),
+                    repositories: Vec::new(),
+                    compiler_release: None,
+                    compiler_source: None,
+                },
+            );
+            return Ok(());
+        }
+        bail!(
+            "cannot download POM for {key} — not found in any repository:\n{}\n\
+             check the version, or fix the [repositories] entries in {}",
+            tried.join("\n"),
+            crate::config::CONFIG_FILE
+        )
+    }
+
+    /// The repository that carries the artifact's jar, when the POM is
+    /// missing.  `file://` repositories are checked on disk; HTTP
+    /// repositories via a HEAD request.
+    fn jar_exists(&self, artifact: &Artifact) -> Option<String> {
+        let jar_path = format!("{}{}", artifact.directory(), artifact.jar_file_name());
+        for repo in &self.repos {
+            if let Some(base_dir) = crate::cache::file_url_path(repo) {
+                if base_dir.join(&jar_path).is_file() {
+                    return Some(repo.clone());
+                }
+            } else {
+                let url = format!("{repo}/{jar_path}");
+                if self
+                    .client
+                    .head(&url)
+                    .send()
+                    .is_ok_and(|response| response.status().is_success())
+                {
+                    return Some(repo.clone());
+                }
+            }
+        }
+        None
     }
 
     /// Build the display tree for the final chosen versions, following the
@@ -496,5 +565,34 @@ mod tests {
         assert_eq!(pom.group_id.as_deref(), Some("com.example"));
         assert_eq!(pom.dependencies.len(), 1);
         assert!(!is_runtime_dependency(&pom.dependencies[0])); // test scope
+    }
+
+    #[test]
+    fn resolves_jar_when_pom_is_missing() {
+        // A local repository with the jar but no POM (like the BeetRoot lib/repo).
+        let dir = std::env::temp_dir().join(format!("jip-resolver-{}", std::process::id()));
+        let artifact_dir = dir.join("repo/com/example/widget/1.0.0");
+        std::fs::create_dir_all(&artifact_dir).unwrap();
+        std::fs::write(artifact_dir.join("widget-1.0.0.jar"), b"jar bytes").unwrap();
+
+        let repo_url = format!("file://{}", dir.join("repo").display());
+        let mut resolver = Resolver::new(reqwest::blocking::Client::new(), &[repo_url]);
+        let artifact = Artifact::parse("com.example:widget:1.0.0").unwrap();
+        resolver.fetch_pom(&artifact).unwrap();
+
+        let key = "com.example:widget:1.0.0";
+        let pom = resolver.pom_cache.get(key).expect("leaf POM inserted");
+        assert!(pom.dependencies.is_empty());
+        assert_eq!(pom.artifact_id.as_deref(), Some("widget"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_pom_and_jar_is_an_error() {
+        let mut resolver = Resolver::new(reqwest::blocking::Client::new(), &[]);
+        let artifact = Artifact::parse("com.example:missing:1.0.0").unwrap();
+        let err = resolver.fetch_pom(&artifact).unwrap_err();
+        assert!(format!("{err:#}").contains("cannot download POM"));
     }
 }

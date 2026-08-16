@@ -28,6 +28,7 @@ mod central;
 mod cli;
 mod commands;
 mod config;
+mod console;
 mod convert;
 mod lock;
 mod pom;
@@ -44,7 +45,7 @@ fn main() -> ExitCode {
     match run(args.command) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("jip: error: {err:#}");
+            eprintln!("{} {err:#}", console::red(&console::bold("jip: error:")));
             ExitCode::FAILURE
         }
     }
@@ -55,11 +56,23 @@ fn run(command: Command) -> anyhow::Result<()> {
     let client = commands::new_client();
     match command {
         Command::Init => commands::init::run(&client),
-        Command::Add { dependency, test } => commands::add::run(&client, &dependency, test),
-        Command::Remove { dependency, test } => commands::remove::run(&client, &dependency, test),
+        Command::Add {
+            dependency,
+            test,
+            provided,
+        } => commands::add::run(&client, &dependency, test, provided),
+        Command::Remove {
+            dependency,
+            test,
+            provided,
+        } => commands::remove::run(&client, &dependency, test, provided),
         Command::Resolve => commands::resolve::run(&client),
         Command::Build => commands::build::run(&client),
-        Command::Run { main, args } => commands::run::run(&client, main.as_deref(), &args),
+        Command::Run {
+            main,
+            defines,
+            args,
+        } => commands::run::run(&client, main.as_deref(), &defines, &args),
         Command::Test => commands::test::run(&client),
         Command::Search { query } => commands::search::run(&client, &query),
         Command::Tree => commands::tree::run(&client),

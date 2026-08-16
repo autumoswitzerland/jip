@@ -31,7 +31,8 @@ use anyhow::Context;
 
 use crate::commands::build::{self, CLASSES_DIR};
 use crate::commands::{
-    check_java_version, classpath_for, classpath_string, load_config, test_classpath_for,
+    check_java_version, classpath_string, compile_classpath_for, load_config,
+    provided_classpath_for, test_classpath_for,
 };
 use crate::convert::{self, ConversionOffer};
 
@@ -47,7 +48,7 @@ pub fn run(client: &reqwest::blocking::Client) -> anyhow::Result<()> {
     let config = match convert::offer_conversion(client)? {
         ConversionOffer::Converted(config) => config,
         ConversionOffer::Declined => return Ok(()),
-        ConversionOffer::Proceed => load_config()?,
+        ConversionOffer::Proceed => Box::new(load_config()?),
     };
 
     let test_dir = Path::new(TEST_SOURCE_DIR);
@@ -61,7 +62,6 @@ pub fn run(client: &reqwest::blocking::Client) -> anyhow::Result<()> {
     }
 
     // Lazily download every jar that is not yet cached.
-    let classpath = classpath_for(client, &config)?;
     let test_classpath = test_classpath_for(client, &config)?;
     let standalone = test_classpath
         .iter()
@@ -72,14 +72,19 @@ pub fn run(client: &reqwest::blocking::Client) -> anyhow::Result<()> {
         })?;
     check_java_version(config.project.java.as_deref())?;
 
-    build::compile(&config, &classpath)?;
+    // The main classes compile against runtime plus provided dependencies;
+    // the tests additionally see the test dependencies.
+    let compile_classpath = compile_classpath_for(client, &config)?;
+    build::compile(&config, &compile_classpath)?;
 
-    let mut compile_classpath = vec![PathBuf::from(CLASSES_DIR)];
-    compile_classpath.extend(test_classpath.iter().cloned());
+    let provided = provided_classpath_for(client, &config)?;
+    let mut test_compile_classpath = vec![PathBuf::from(CLASSES_DIR)];
+    test_compile_classpath.extend(provided);
+    test_compile_classpath.extend(test_classpath.iter().cloned());
     let test_classes = Path::new(TEST_CLASSES_DIR);
     build::compile_java(
         &sources,
-        &compile_classpath,
+        &test_compile_classpath,
         test_classes,
         &[PathBuf::from(CLASSES_DIR)],
     )?;

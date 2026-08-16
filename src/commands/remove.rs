@@ -24,30 +24,39 @@ use std::path::Path;
 
 use anyhow::bail;
 
-use crate::commands::{require_config, resolve, resolve_tests, write_lock};
+use crate::commands::{require_config, resolve, resolve_provided, resolve_tests, write_lock};
 use crate::config::CONFIG_FILE;
 
 /// Remove a dependency and re-resolve.
-pub fn run(client: &reqwest::blocking::Client, dependency: &str, test: bool) -> anyhow::Result<()> {
+pub fn run(
+    client: &reqwest::blocking::Client,
+    dependency: &str,
+    test: bool,
+    provided: bool,
+) -> anyhow::Result<()> {
     let mut config = require_config()?;
 
-    let section = if test {
-        "test-dependencies"
+    let (section, removed): (&str, Option<String>) = if provided {
+        (
+            "provided-dependencies",
+            config.provided_dependencies.remove(dependency),
+        )
+    } else if test {
+        (
+            "test-dependencies",
+            config.test_dependencies.remove(dependency),
+        )
     } else {
-        "dependencies"
-    };
-    let removed = if test {
-        config.test_dependencies.remove(dependency)
-    } else {
-        config.dependencies.remove(dependency)
+        ("dependencies", config.dependencies.remove(dependency))
     };
     if removed.is_none() {
         bail!("{dependency} is not in [{section}] in {CONFIG_FILE}");
     }
 
     let resolution = resolve(client, &config)?;
+    let provided = resolve_provided(client, &config)?;
     let tests = resolve_tests(client, &config)?;
-    write_lock(&resolution.flat, &tests.flat)?;
+    write_lock(&resolution.flat, &provided.flat, &tests.flat)?;
     config.save(Path::new(CONFIG_FILE))?;
 
     println!(

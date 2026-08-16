@@ -30,22 +30,26 @@ use std::process::Command;
 
 use anyhow::{Context, bail};
 
-use crate::commands::build::{self, MainTarget};
-use crate::commands::{check_java_version, classpath_for, classpath_string, load_config};
+use crate::commands::build::{self, MainDecision, MainTarget};
+use crate::commands::{
+    check_java_version, classpath_for, classpath_string, compile_classpath_for, load_config,
+};
+use crate::config::CONFIG_FILE;
 use crate::convert::{self, ConversionOffer};
 
 /// Run the project's main class with all dependencies on the classpath.
 pub fn run(
     client: &reqwest::blocking::Client,
     main_arg: Option<&str>,
+    defines: &[String],
     program_args: &[String],
 ) -> anyhow::Result<()> {
     // Offer to convert a detected Maven/Gradle project when jip.toml is
     // missing, so `jip run` works right after cloning a foreign repo.
-    let config = match convert::offer_conversion(client)? {
+    let mut config = match convert::offer_conversion(client)? {
         ConversionOffer::Converted(config) => config,
         ConversionOffer::Declined => return Ok(()),
-        ConversionOffer::Proceed => load_config()?,
+        ConversionOffer::Proceed => Box::new(load_config()?),
     };
 
     // Lazily download every jar that is not yet cached.
@@ -53,9 +57,33 @@ pub fn run(
 
     check_java_version(config.project.java.as_deref())?;
 
-    let target = match build::main_target(&config, main_arg)? {
-        Some(target) => target,
-        None => bail!(
+    // A positional that is not a main class of this project is the first
+    // program argument, so `jip run start` runs `[project] main` with
+    // `start` instead of failing to load a class named `start`.
+    let mut program_args = program_args.to_vec();
+    let main_arg = match main_arg {
+        Some(arg) if !build::is_main_class(&config, arg) => {
+            program_args.insert(0, arg.to_string());
+            None
+        }
+        arg => arg,
+    };
+
+    let target = match build::resolve_main(&config, main_arg)? {
+        MainDecision::Run(target) => target,
+        MainDecision::Multiple(candidates) => {
+            let target = build::choose_main(&candidates)?;
+            if let MainTarget::Class(fqcn) = &target {
+                config.project.main = Some(fqcn.clone());
+                config.save(Path::new(CONFIG_FILE))?;
+                println!(
+                    "{}",
+                    crate::console::green(&format!("saved [project] main = \"{fqcn}\""))
+                );
+            }
+            target
+        }
+        MainDecision::None => bail!(
             "no main class found — write a class with `public static void main` \
              under {} or set [project] main in jip.toml",
             build::source_dir(&config).display()
@@ -63,6 +91,9 @@ pub fn run(
     };
 
     let mut command = Command::new("java");
+    for define in defines {
+        command.arg(format!("-D{define}"));
+    }
     match target {
         MainTarget::SourceFile(path) => {
             if !path.exists() {
@@ -86,7 +117,10 @@ pub fn run(
                 .arg(&main_class);
         }
         MainTarget::Class(name) => {
-            build::compile(&config, &classpath)?;
+            // Provided dependencies are compile-time only: javac sees them,
+            // the running program does not.
+            let compile_classpath = compile_classpath_for(client, &config)?;
+            build::compile(&config, &compile_classpath)?;
             let mut run_classpath = vec![PathBuf::from(build::CLASSES_DIR)];
             run_classpath.extend(classpath);
             command
@@ -95,7 +129,7 @@ pub fn run(
                 .arg(&name);
         }
     }
-    command.args(program_args);
+    command.args(&program_args);
 
     // Hand over to the child process: same output, same exit code.
     let status = command.status().context("failed to start `java`")?;

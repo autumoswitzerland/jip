@@ -29,8 +29,7 @@ use anyhow::Context;
 use roxmltree::Document;
 use serde::Deserialize;
 
-use crate::cache::download_text;
-use crate::resolver::DEFAULT_REPO_URL;
+use crate::cache::download_repo_text;
 
 /// Base URL of the Maven Central search API.
 const SEARCH_URL: &str = "https://search.maven.org/solrsearch/select";
@@ -107,25 +106,28 @@ pub fn search(
 
 /// Look up the latest published version of one artifact, preferring a
 /// stable release over a pre-release (milestone, RC, snapshot, ...).
+///
+/// `repos` are checked in order (custom repositories first, Maven Central
+/// last); the first repository whose `maven-metadata.xml` resolves wins.
 pub fn latest_version(
     client: &reqwest::blocking::Client,
+    repos: &[String],
     group: &str,
     artifact: &str,
 ) -> anyhow::Result<Option<String>> {
-    let metadata_url = format!(
-        "{DEFAULT_REPO_URL}/{}/{artifact}/maven-metadata.xml",
-        group.replace('.', "/")
-    );
-    match download_text(client, &metadata_url) {
-        Ok(metadata) => Ok(parse_latest_stable(&metadata)),
-        // Fall back to the search service's "latest" when the metadata
-        // cannot be read; that value may include pre-releases.
-        Err(_) => {
-            let query = format!("g:\"{group}\" AND a:\"{artifact}\"");
-            let results = search(client, &query, 1)?;
-            Ok(results.first().map(|r| r.latest_version.clone()))
+    let metadata_path = format!("{}/{artifact}/maven-metadata.xml", group.replace('.', "/"));
+    for repo in repos {
+        if let Ok(metadata) = download_repo_text(client, repo, &metadata_path)
+            && let Some(version) = parse_latest_stable(&metadata)
+        {
+            return Ok(Some(version));
         }
     }
+    // Fall back to the search service's "latest" when no repository answers;
+    // that value may include pre-releases.
+    let query = format!("g:\"{group}\" AND a:\"{artifact}\"");
+    let results = search(client, &query, 1)?;
+    Ok(results.first().map(|r| r.latest_version.clone()))
 }
 
 /// The newest stable version listed in a `maven-metadata.xml` file.

@@ -39,8 +39,11 @@ pub fn run(client: &reqwest::blocking::Client) -> anyhow::Result<()> {
 
     let config = convert::convert_project(client)?;
 
-    println!("created {CONFIG_FILE}");
-    println!("created {LOCK_FILE}");
+    println!(
+        "{}",
+        crate::console::green(&format!("created {CONFIG_FILE}"))
+    );
+    println!("{}", crate::console::green(&format!("created {LOCK_FILE}")));
     if config.dependencies.is_empty() {
         println!("next: add a dependency with `jip add group:artifact:version`");
     } else {

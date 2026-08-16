@@ -25,34 +25,48 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::central;
-use crate::commands::{require_config, resolve, resolve_tests, write_lock};
+use crate::commands::{
+    repositories_for, require_config, resolve, resolve_provided, resolve_tests, write_lock,
+};
 use crate::config::CONFIG_FILE;
 
 /// Update all direct dependencies to their latest versions.
 pub fn run(client: &reqwest::blocking::Client) -> anyhow::Result<()> {
     let mut config = require_config()?;
+    let repos = repositories_for(&config);
 
     let mut changed = 0;
-    changed += update_versions(client, &mut config.dependencies)?;
-    changed += update_versions(client, &mut config.test_dependencies)?;
+    changed += update_versions(client, &repos, &mut config.dependencies)?;
+    changed += update_versions(client, &repos, &mut config.provided_dependencies)?;
+    changed += update_versions(client, &repos, &mut config.test_dependencies)?;
 
     if changed == 0 {
-        println!("all dependencies are up to date");
+        println!(
+            "{}",
+            crate::console::green("all dependencies are up to date")
+        );
         return Ok(());
     }
 
     let resolution = resolve(client, &config)?;
+    let provided = resolve_provided(client, &config)?;
     let tests = resolve_tests(client, &config)?;
-    write_lock(&resolution.flat, &tests.flat)?;
+    write_lock(&resolution.flat, &provided.flat, &tests.flat)?;
     config.save(Path::new(CONFIG_FILE))?;
-    println!("updated {changed} dependencies — {CONFIG_FILE} and jip.lock are in sync");
+    println!(
+        "{}",
+        crate::console::green(&format!(
+            "updated {changed} dependencies — {CONFIG_FILE} and jip.lock are in sync"
+        ))
+    );
     Ok(())
 }
 
-/// Update one dependency map to the latest versions on Maven Central,
+/// Update one dependency map to the latest versions on the repositories,
 /// returning how many entries changed.
 fn update_versions(
     client: &reqwest::blocking::Client,
+    repos: &[String],
     deps: &mut BTreeMap<String, String>,
 ) -> anyhow::Result<usize> {
     let mut changed = 0;
@@ -60,7 +74,7 @@ fn update_versions(
         let Some((group, artifact)) = key.split_once(':') else {
             continue;
         };
-        let Some(latest) = central::latest_version(client, group, artifact)? else {
+        let Some(latest) = central::latest_version(client, repos, group, artifact)? else {
             println!("{key}: no version found on Maven Central");
             continue;
         };

@@ -70,21 +70,45 @@ pub fn require_config() -> anyhow::Result<ProjectConfig> {
     load_config()
 }
 
+/// The list of repositories to try, custom ones first and Maven Central last.
+pub fn repositories_for(config: &ProjectConfig) -> Vec<String> {
+    let mut repos: Vec<String> = config.repositories.values().cloned().collect();
+    repos.push(DEFAULT_REPO_URL.to_string());
+    repos
+}
+
 /// Run a full resolution for the project's runtime dependencies.
 pub fn resolve(client: &Client, config: &ProjectConfig) -> anyhow::Result<Resolution> {
-    let mut resolver = Resolver::new(client.clone(), DEFAULT_REPO_URL);
+    let mut resolver = Resolver::new(client.clone(), &repositories_for(config));
     resolver.resolve_project(config)
 }
 
 /// Run a full resolution for the project's test dependencies.
 pub fn resolve_tests(client: &Client, config: &ProjectConfig) -> anyhow::Result<Resolution> {
-    let mut resolver = Resolver::new(client.clone(), DEFAULT_REPO_URL);
+    let mut resolver = Resolver::new(client.clone(), &repositories_for(config));
     resolver.resolve_project_tests(config)
 }
 
-/// Write a new `jip.lock` from the runtime and test artifact lists.
-pub fn write_lock(artifacts: &[Artifact], test_artifacts: &[Artifact]) -> anyhow::Result<()> {
-    LockFile::from_artifacts(artifacts.to_vec(), test_artifacts.to_vec()).save(Path::new(LOCK_FILE))
+/// Run a full resolution for the project's compile-only (`provided`)
+/// dependencies.
+pub fn resolve_provided(client: &Client, config: &ProjectConfig) -> anyhow::Result<Resolution> {
+    let mut resolver = Resolver::new(client.clone(), &repositories_for(config));
+    resolver.resolve_project_provided(config)
+}
+
+/// Write a new `jip.lock` from the runtime, compile-only, and test artifact
+/// lists.
+pub fn write_lock(
+    artifacts: &[Artifact],
+    provided: &[Artifact],
+    test_artifacts: &[Artifact],
+) -> anyhow::Result<()> {
+    LockFile::from_artifacts(
+        artifacts.to_vec(),
+        provided.to_vec(),
+        test_artifacts.to_vec(),
+    )
+    .save(Path::new(LOCK_FILE))
 }
 
 /// A cache configured from the project's settings.
@@ -93,31 +117,37 @@ pub fn cache_for(client: &Client, config: &ProjectConfig) -> Cache {
 }
 
 /// Download any jar that is not yet available locally.
-pub fn ensure_jars(cache: &Cache, artifacts: &[Artifact]) -> anyhow::Result<()> {
+pub fn ensure_jars(cache: &Cache, artifacts: &[Artifact], repos: &[String]) -> anyhow::Result<()> {
     for artifact in artifacts {
         cache
-            .ensure_jar(artifact, DEFAULT_REPO_URL)
+            .ensure_jar(artifact, repos)
             .with_context(|| format!("cannot obtain {}", artifact.jar_file_name()))?;
     }
     Ok(())
 }
 
-/// The pinned runtime and test artifacts from `jip.lock`, or a freshly
-/// resolved set when the lock file is missing (writing it back so the
-/// project stays reproducible).
+/// The pinned runtime, compile-only, and test artifacts from `jip.lock`, or
+/// a freshly resolved set when the lock file is missing (writing it back so
+/// the project stays reproducible).
 fn lock_parts(
     client: &Client,
     config: &ProjectConfig,
-) -> anyhow::Result<(Vec<Artifact>, Vec<Artifact>)> {
+) -> anyhow::Result<(Vec<Artifact>, Vec<Artifact>, Vec<Artifact>)> {
     if let Some(lock) = LockFile::load(Path::new(LOCK_FILE))? {
         let runtime = lock.packages.iter().map(|p| p.to_artifact()).collect();
+        let provided = lock
+            .provided_packages
+            .iter()
+            .map(|p| p.to_artifact())
+            .collect();
         let test = lock.test_packages.iter().map(|p| p.to_artifact()).collect();
-        return Ok((runtime, test));
+        return Ok((runtime, provided, test));
     }
     let resolution = resolve(client, config)?;
+    let provided = resolve_provided(client, config)?;
     let tests = resolve_tests(client, config)?;
-    write_lock(&resolution.flat, &tests.flat)?;
-    Ok((resolution.flat, tests.flat))
+    write_lock(&resolution.flat, &provided.flat, &tests.flat)?;
+    Ok((resolution.flat, provided.flat, tests.flat))
 }
 
 /// The pinned runtime artifacts from `jip.lock`.
@@ -126,26 +156,71 @@ pub fn locked_artifacts(client: &Client, config: &ProjectConfig) -> anyhow::Resu
 }
 
 /// The resolved runtime dependency jars, downloading anything that is not
-/// cached yet.
+/// cached yet, plus the configured `[classpath] extra` entries.
 pub fn classpath_for(client: &Client, config: &ProjectConfig) -> anyhow::Result<Vec<PathBuf>> {
     let cache = cache_for(client, config);
+    let repos = repositories_for(config);
     let mut classpath = Vec::new();
     for artifact in locked_artifacts(client, config)? {
-        classpath.push(cache.ensure_jar(&artifact, DEFAULT_REPO_URL)?);
+        classpath.push(cache.ensure_jar(&artifact, &repos)?);
     }
+    classpath.extend(classpath_extras(&config.classpath.extra));
     Ok(classpath)
 }
 
 /// The runtime and test dependency jars, downloading anything that is not
-/// cached yet.  This is the classpath `jip test` works with.
+/// cached yet, plus the configured `[classpath]` entries.  This is the
+/// classpath `jip test` works with.
 pub fn test_classpath_for(client: &Client, config: &ProjectConfig) -> anyhow::Result<Vec<PathBuf>> {
     let cache = cache_for(client, config);
-    let (runtime, test) = lock_parts(client, config)?;
+    let repos = repositories_for(config);
+    let (runtime, _, test) = lock_parts(client, config)?;
     let mut classpath = Vec::new();
     for artifact in runtime.into_iter().chain(test) {
-        classpath.push(cache.ensure_jar(&artifact, DEFAULT_REPO_URL)?);
+        classpath.push(cache.ensure_jar(&artifact, &repos)?);
+    }
+    let mut extras = config.classpath.extra.clone();
+    extras.extend(config.classpath.test_extra.iter().cloned());
+    classpath.extend(classpath_extras(&extras));
+    Ok(classpath)
+}
+
+/// The compile-only (`provided`) dependency jars, from `[provided-dependencies]`.
+///
+/// These exist for `javac` only and never reach the classpath of a running
+/// program, mirroring Maven's `provided` scope.
+pub fn provided_classpath_for(
+    client: &Client,
+    config: &ProjectConfig,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let cache = cache_for(client, config);
+    let repos = repositories_for(config);
+    let mut classpath = Vec::new();
+    for artifact in lock_parts(client, config)?.1 {
+        classpath.push(cache.ensure_jar(&artifact, &repos)?);
     }
     Ok(classpath)
+}
+
+/// The jars `javac` compiles against: runtime plus compile-only
+/// (`provided`) dependencies.  This is the classpath used by
+/// `jip build` and the compile step of `jip run`/`jip test`.
+pub fn compile_classpath_for(
+    client: &Client,
+    config: &ProjectConfig,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let mut classpath = classpath_for(client, config)?;
+    classpath.extend(provided_classpath_for(client, config)?);
+    Ok(classpath)
+}
+
+/// Turn configured classpath entries into paths, skipping empty strings.
+fn classpath_extras(entries: &[String]) -> Vec<PathBuf> {
+    entries
+        .iter()
+        .filter(|entry| !entry.is_empty())
+        .map(PathBuf::from)
+        .collect()
 }
 
 /// Join classpath entries with the platform's separator.
