@@ -22,7 +22,10 @@
 // =============================================================================
 
 use std::collections::BTreeMap;
+use std::io::{IsTerminal, Write};
 use std::path::Path;
+
+use anyhow::bail;
 
 use crate::central;
 use crate::commands::{
@@ -45,6 +48,26 @@ pub fn run(client: &reqwest::blocking::Client) -> anyhow::Result<()> {
             "{}",
             crate::console::green("all dependencies are up to date")
         );
+        return Ok(());
+    }
+
+    if !std::io::stdin().is_terminal() {
+        bail!("run `jip update` interactively to confirm version bumps");
+    }
+
+    print!(
+        "\n{} ",
+        crate::console::bold(&format!(
+            "update {changed} dependencies to the versions listed above?"
+        ))
+    );
+    print!("[y/N] ");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    let answer = answer.trim();
+    if !matches!(answer, "y" | "Y" | "yes" | "Yes") {
+        println!("update cancelled — {} and jip.lock unchanged", CONFIG_FILE);
         return Ok(());
     }
 

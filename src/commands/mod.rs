@@ -25,6 +25,7 @@
 pub mod add;
 pub mod build;
 pub mod init;
+pub mod jar;
 pub mod remove;
 pub mod resolve;
 pub mod run;

@@ -1,10 +1,15 @@
 [package]
 name = "jip"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
-description = "A pip-like dependency manager and runner for Java"
-license = "AGPL-3.0-only"
+description = "A pip-like dependency manager and runner for Java — clone it. Run it. Done."
+license = "AGPL-3.0-or-later"
+readme = "README.md"
+repository = "https://github.com/autumoswitzerland/jip"
+homepage = "https://github.com/autumoswitzerland/jip"
 authors = ["autumo GmbH"]
+keywords = ["java", "dependency-manager", "maven", "gradle", "build-tool"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1"

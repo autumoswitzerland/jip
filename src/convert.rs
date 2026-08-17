@@ -36,6 +36,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{IsTerminal, Write};
 use std::path::Path;
+use std::sync::OnceLock;
 
 use anyhow::{Context, bail};
 use regex::Regex;
@@ -129,7 +130,7 @@ pub fn collect_dependencies(project_type: ProjectType) -> anyhow::Result<Convert
                 runtime,
                 provided: gradle_provided_dependencies_from_content(&content)?,
                 test,
-                repositories: BTreeMap::new(),
+                repositories: gradle_repositories_from_content(&content),
             })
         }
         ProjectType::GradleKotlin => {
@@ -140,7 +141,7 @@ pub fn collect_dependencies(project_type: ProjectType) -> anyhow::Result<Convert
                 runtime,
                 provided: gradle_provided_dependencies_from_content(&content)?,
                 test,
-                repositories: BTreeMap::new(),
+                repositories: gradle_repositories_from_content(&content),
             })
         }
     }
@@ -358,6 +359,93 @@ pub fn gradle_provided_dependencies_from_content(
     Ok(provided)
 }
 
+/// Extract custom Maven repository URLs from a Gradle build script.
+///
+/// Recognises `maven { url = uri("...") }` blocks and Kotlin inline
+/// `maven("...")` declarations.  `$projectDir` is resolved against the
+/// current directory.  Well-known repositories (`mavenCentral()`,
+/// `mavenLocal()`, `gradlePluginPortal()`) are ignored — jip adds
+/// Maven Central automatically.
+pub fn gradle_repositories_from_content(content: &str) -> BTreeMap<String, String> {
+    let re_url_uri =
+        Regex::new(r#"url\s*=\s*uri\(["']([^"']+)["']\)"#).expect("valid url=uri regex");
+    let re_url_eq = Regex::new(r#"url\s*=\s*["']([^"']+)["']"#).expect("valid url= regex");
+    let re_url_space = Regex::new(r#"url\s+["']([^"']+)["']"#).expect("valid url regex");
+    let re_maven_inline =
+        Regex::new(r#"maven\(["']([^"']+)["']\)"#).expect("valid maven inline regex");
+
+    let basedir = std::env::current_dir()
+        .ok()
+        .map(|dir| dir.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    let resolve = |url: &str| -> String {
+        let url = url.replace("$projectDir", &basedir);
+        url.replace("${projectDir}", &basedir)
+    };
+
+    let mut repos = BTreeMap::new();
+    let mut depth = 0i32;
+    let mut in_repositories = 0i32;
+    let mut in_maven = 0i32;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("//") || trimmed.starts_with("/*") {
+            continue;
+        }
+
+        let open = trimmed.chars().filter(|&c| c == '{').count();
+        let close = trimmed.chars().filter(|&c| c == '}').count();
+
+        // Enter repositories block
+        if in_repositories == 0 && open > 0 && trimmed.contains("repositories") {
+            in_repositories = depth + 1;
+        }
+        // Enter maven block inside repositories
+        if in_repositories > 0 && in_maven == 0 && open > 0 && trimmed.contains("maven") {
+            in_maven = depth + 1;
+        }
+
+        depth += open as i32;
+
+        // Extract URLs inside maven { } blocks
+        if in_maven > 0 {
+            if let Some(caps) = re_url_uri.captures(trimmed) {
+                let url = resolve(caps.get(1).unwrap().as_str());
+                repos.insert(url.clone(), url);
+            } else if let Some(caps) = re_url_eq.captures(trimmed) {
+                let url = resolve(caps.get(1).unwrap().as_str());
+                repos.insert(url.clone(), url);
+            } else if let Some(caps) = re_url_space.captures(trimmed) {
+                let url = resolve(caps.get(1).unwrap().as_str());
+                repos.insert(url.clone(), url);
+            }
+        }
+
+        // Kotlin inline maven("url") inside repositories { }
+        if in_repositories > 0
+            && in_maven == 0
+            && let Some(caps) = re_maven_inline.captures(trimmed)
+        {
+            let url = resolve(caps.get(1).unwrap().as_str());
+            repos.insert(url.clone(), url);
+        }
+
+        depth -= close as i32;
+
+        // Exit blocks
+        if in_maven > 0 && depth < in_maven {
+            in_maven = 0;
+        }
+        if in_repositories > 0 && depth < in_repositories {
+            in_repositories = 0;
+        }
+    }
+
+    repos
+}
+
 /// Match a single-line `group:artifact:version` declaration, reporting
 /// whether the configuration is a test one.
 fn match_shorthand(line: &str, re: &Regex) -> Option<(ConvertedDependency, bool)> {
@@ -525,13 +613,28 @@ pub fn convert_project(client: &reqwest::blocking::Client) -> anyhow::Result<Pro
 }
 
 /// The Java version jip writes into a fresh `jip.toml`: the project's own
-/// value when declared (Maven), otherwise the installed JDK on `PATH`.
+/// value when declared (Maven/Gradle), otherwise the installed JDK on `PATH`.
 fn java_default_for(project_type: Option<ProjectType>) -> String {
     if matches!(project_type, Some(ProjectType::Maven))
         && let Ok(xml) = fs::read_to_string("pom.xml")
         && let Ok(Some(version)) = maven_java_version_from_xml(&xml)
     {
         return version;
+    }
+    if matches!(
+        project_type,
+        Some(ProjectType::GradleGroovy | ProjectType::GradleKotlin)
+    ) {
+        let filename = match project_type.unwrap() {
+            ProjectType::GradleGroovy => "build.gradle",
+            ProjectType::GradleKotlin => "build.gradle.kts",
+            _ => unreachable!(),
+        };
+        if let Ok(content) = fs::read_to_string(filename)
+            && let Some(version) = gradle_java_version_from_content(&content)
+        {
+            return version;
+        }
     }
     installed_java_default()
 }
@@ -578,6 +681,30 @@ fn normalize_java_major(version: &str) -> String {
     crate::commands::parse_major(version)
         .map(|major| major.to_string())
         .unwrap_or_else(|_| version.to_string())
+}
+
+/// The Java version a Gradle project compiles for, extracted from the build
+/// script's `toolchain`, `sourceCompatibility`, or `targetCompatibility`.
+/// Returns `None` when no version is declared.
+pub fn gradle_java_version_from_content(content: &str) -> Option<String> {
+    static RE_TOOLCHAIN: OnceLock<Regex> = OnceLock::new();
+    let re_toolchain = RE_TOOLCHAIN
+        .get_or_init(|| Regex::new(r"languageVersion[^0-9]*(\d+)").expect("valid toolchain regex"));
+    static RE_SOURCE: OnceLock<Regex> = OnceLock::new();
+    let re_source = RE_SOURCE.get_or_init(|| {
+        Regex::new(r"sourceCompatibility[^0-9]*(\d+)").expect("valid source compat regex")
+    });
+    static RE_TARGET: OnceLock<Regex> = OnceLock::new();
+    let re_target = RE_TARGET.get_or_init(|| {
+        Regex::new(r"targetCompatibility[^0-9]*(\d+)").expect("valid target compat regex")
+    });
+
+    re_toolchain
+        .captures(content)
+        .or_else(|| re_source.captures(content))
+        .or_else(|| re_target.captures(content))
+        .and_then(|c| c.get(1))
+        .map(|m| normalize_java_major(m.as_str()))
 }
 
 /// Turn converted dependencies into the `group:artifact` -> version map.
@@ -937,5 +1064,125 @@ mod tests {
         let runtime_keys: Vec<String> = runtime.iter().map(|d| d.key()).collect();
         assert_eq!(runtime_keys, vec!["com.google.guava:guava"]);
         assert!(test.is_empty());
+    }
+
+    #[test]
+    fn gradle_java_version_from_toolchain() {
+        let script = r#"
+            java {
+                toolchain {
+                    languageVersion = JavaLanguageVersion.of(17)
+                }
+            }
+        "#;
+        assert_eq!(
+            gradle_java_version_from_content(script).as_deref(),
+            Some("17")
+        );
+    }
+
+    #[test]
+    fn gradle_java_version_from_kotlin_toolchain() {
+        let script = r#"
+            java {
+                toolchain {
+                    languageVersion.set(JavaLanguageVersion.of(21))
+                }
+            }
+        "#;
+        assert_eq!(
+            gradle_java_version_from_content(script).as_deref(),
+            Some("21")
+        );
+    }
+
+    #[test]
+    fn gradle_java_version_from_source_compatibility() {
+        let script = r#"
+            sourceCompatibility = JavaVersion.VERSION_11
+            targetCompatibility = JavaVersion.VERSION_11
+        "#;
+        assert_eq!(
+            gradle_java_version_from_content(script).as_deref(),
+            Some("11")
+        );
+    }
+
+    #[test]
+    fn gradle_java_version_from_string_source() {
+        let script = r#"
+            sourceCompatibility = '11'
+        "#;
+        assert_eq!(
+            gradle_java_version_from_content(script).as_deref(),
+            Some("11")
+        );
+    }
+
+    #[test]
+    fn gradle_java_version_without_configuration_is_none() {
+        let script = r#"
+            dependencies {
+                implementation 'org.apache.commons:commons-text:1.14.0'
+            }
+        "#;
+        assert_eq!(gradle_java_version_from_content(script), None);
+    }
+
+    #[test]
+    fn gradle_repositories_groovy_url_uri() {
+        let script = r#"
+            repositories {
+                maven {
+                    url = uri("$projectDir/lib/repo")
+                }
+                mavenCentral()
+            }
+        "#;
+        let repos = gradle_repositories_from_content(script);
+        assert_eq!(repos.len(), 1);
+        let url = &repos["/Users/Mike/Development/OpenCode/jip/lib/repo"];
+        assert!(url.starts_with("/"));
+        assert!(url.ends_with("/lib/repo"));
+    }
+
+    #[test]
+    fn gradle_repositories_kotlin_inline() {
+        let script = r#"
+            repositories {
+                maven("file:///custom/repo")
+                mavenCentral()
+            }
+        "#;
+        let repos = gradle_repositories_from_content(script);
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos["file:///custom/repo"], "file:///custom/repo");
+    }
+
+    #[test]
+    fn gradle_repositories_groovy_url_shorthand() {
+        let script = r#"
+            repositories {
+                maven {
+                    url 'file:///local/repo'
+                }
+            }
+        "#;
+        let repos = gradle_repositories_from_content(script);
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos["file:///local/repo"], "file:///local/repo");
+    }
+
+    #[test]
+    fn gradle_repositories_skips_maven_central() {
+        let script = r#"
+            repositories {
+                mavenCentral()
+                mavenLocal()
+                gradlePluginPortal()
+            }
+        "#;
+        let repos = gradle_repositories_from_content(script);
+        assert!(repos.is_empty());
     }
 }

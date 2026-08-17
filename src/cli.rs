@@ -23,7 +23,7 @@
 
 use clap::{Parser, Subcommand};
 
-/// A pip-like dependency manager and runner for Java.
+/// A pip-like dependency manager and runner for Java — clone it. Run it. Done.
 #[derive(Debug, Parser)]
 #[command(name = "jip", version, about, long_about = None)]
 pub struct Jip {
@@ -80,6 +80,18 @@ pub enum Command {
     /// from the `junit-platform-console-standalone` dependency.  With no
     /// test sources the command reports nothing to do.
     Test,
+
+    /// Package the project's compiled classes into a jar.
+    ///
+    /// Creates `target/app.jar` from the compiled classes in `target/classes`.
+    /// With `--fat`, all dependency jars are merged into a single uber jar.
+    /// After a thin jar is built, jip asks whether to add it to the
+    /// runtime classpath.
+    Jar {
+        /// Build a fat (uber) jar that includes all dependencies.
+        #[arg(long)]
+        fat: bool,
+    },
 
     /// Run the project's main class with all dependencies on the classpath.
     ///

@@ -73,6 +73,7 @@ fn run(command: Command) -> anyhow::Result<()> {
             defines,
             args,
         } => commands::run::run(&client, main.as_deref(), &defines, &args),
+        Command::Jar { fat } => commands::jar::run(&client, fat),
         Command::Test => commands::test::run(&client),
         Command::Search { query } => commands::search::run(&client, &query),
         Command::Tree => commands::tree::run(&client),
