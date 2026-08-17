@@ -1,5 +1,7 @@
 <div align="center">
 
+  <img src="social-preview.png" alt="jip" width="640">
+
   <h1>jip</h1>
 
   A pip-like dependency manager and runner for Java — clone it. Run it. Done.
