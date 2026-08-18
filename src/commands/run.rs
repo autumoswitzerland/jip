@@ -90,7 +90,8 @@ pub fn run(
         ),
     };
 
-    let mut command = Command::new("java");
+    let java = crate::commands::java_binary()?;
+    let mut command = Command::new(&java);
     for define in defines {
         command.arg(format!("-D{define}"));
     }
@@ -132,7 +133,9 @@ pub fn run(
     command.args(&program_args);
 
     // Hand over to the child process: same output, same exit code.
-    let status = command.status().context("failed to start `java`")?;
+    let status = command
+        .status()
+        .with_context(|| format!("failed to start {} — is a JDK installed?", java.display()))?;
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
     }

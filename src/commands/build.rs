@@ -116,14 +116,15 @@ pub fn compile_java(
     }
 
     fs::create_dir_all(out_dir).with_context(|| format!("cannot create {}", out_dir.display()))?;
-    let status = Command::new("javac")
+    let javac = crate::commands::javac_binary()?;
+    let status = Command::new(&javac)
         .arg("-d")
         .arg(out_dir)
         .arg("-classpath")
         .arg(classpath_string(classpath))
         .args(sources)
         .status()
-        .context("failed to start `javac` — is a JDK installed?")?;
+        .with_context(|| format!("failed to start {} — is a JDK installed?", javac.display()))?;
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
     }

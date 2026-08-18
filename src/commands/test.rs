@@ -95,7 +95,8 @@ pub fn run(client: &reqwest::blocking::Client) -> anyhow::Result<()> {
     // Run the launcher with the test classes on the scan path, keeping the
     // child's output and exit code.  JUnit Platform 6+ moved the options
     // behind an `execute` subcommand.
-    let mut command = Command::new("java");
+    let java = crate::commands::java_binary()?;
+    let mut command = Command::new(&java);
     command
         .arg("--class-path")
         .arg(classpath_string(&run_classpath))
@@ -111,7 +112,7 @@ pub fn run(client: &reqwest::blocking::Client) -> anyhow::Result<()> {
         .arg("tree");
     let status = command
         .status()
-        .context("failed to start `java` — is a JDK installed?")?;
+        .with_context(|| format!("failed to start {} — is a JDK installed?", java.display()))?;
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
     }

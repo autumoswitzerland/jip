@@ -197,13 +197,43 @@ Removes the `target/` directory with all build artifacts (classes, tests, jars).
 
 ### `jip completion`
 
-Prints a completion script for the given shell, generated from the command definition so it always matches the installed version:
+Prints a shell completion script (bash, zsh, or fish) to stdout. The output starts with a blank line and a `# --- jip shell completions ...` comment, so it can be appended to a shell config file without mashing against existing content.
+
+The script is generated from the command definition, so completions always match the installed version of jip. After appending, start a new shell (or `source` the config file) for the completions to take effect:
 
 ```bash
-jip completion bash >> ~/.bashrc
-jip completion zsh >> ~/.zshrc
-jip completion fish > ~/.config/fish/completions/jip.fish
+jip completion bash >> ~/.bashrc && source ~/.bashrc
+jip completion zsh  >> ~/.zshrc  && source ~/.zshrc
+jip completion fish >  ~/.config/fish/completions/jip.fish
 ```
+
+Once installed, tab-completion works like in any other CLI:
+
+```
+jip <TAB>        # lists commands: init, add, run, build, clean, list, ...
+jip ru<TAB>      # completes to: jip run
+jip add --<TAB>  # shows: --test, --provided
+```
+
+### `jip java`
+
+Manage JDK installations — install, list, and switch between versions from different vendors.
+
+```
+jip java list                              # show installed JDKs
+jip java install 21                        # install Zulu JDK 21 (default vendor)
+jip java install 21 --vendor temurin       # install Temurin JDK 21
+jip java use 21                            # set active JDK
+jip java use 21 --vendor zulu              # set active (explicit vendor)
+jip java remove 21                         # remove installed JDK 21
+jip java remove 21 --vendor temurin        # remove specific vendor's JDK 21
+```
+
+Supported vendors: `zulu` (Azul Zulu, default), `temurin` (Eclipse Temurin), `corretto` (Amazon Corretto), `graalvm` (GraalVM CE).
+
+JDKs are stored in `~/.jip/jdks/{vendor}/{version}/`. The active JDK is tracked in `~/.jip/jdk.toml`.
+
+When the active JDK is removed and other JDKs are still installed, `jip` requires switching to another version first. When the last JDK is removed, the active config is cleared and `jip build`/`run`/`test` fall back to the system `java` on PATH.
 
 ## Configuration
 
@@ -256,6 +286,8 @@ extra = ["lib/my-custom.jar", "resources"]
 Custom Maven repositories tried before Maven Central. Keys are arbitrary names, values are base URLs. Supports `https://` and `file://` (local Maven-style folders). During conversion, Maven's `${project.basedir}` and Gradle's `$projectDir` are resolved against the project directory.
 
 ### Dependency scopes
+
+Every dependency lives in one of three scopes. The table shows where each scope is available: on the runtime classpath (when running the app), on the compile classpath (when building), and during tests.
 
 | Scope | Section | `jip add` flag | Runtime | Compile | Test |
 |-------|---------|----------------|---------|---------|------|
@@ -343,6 +375,12 @@ target/app-fat.jar    fat/uber jar (jip jar --fat)
 - **Compilation:** `javac` with the resolved classpath, skip-when-up-to-date based on file timestamps
 - **Execution:** `java --class-path ... MainClass` — jip builds the full classpath, the user never touches `-cp`
 - **No daemon, no background process** — every command runs and exits
+
+## Not supported
+
+jip deliberately does **not** support:
+
+- **Multi-module projects** — jip is a single-module build tool; parent/child module structures are out of scope at the moment
 
 ## License
 

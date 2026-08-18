@@ -30,6 +30,7 @@ mod commands;
 mod config;
 mod console;
 mod convert;
+mod jdk;
 mod lock;
 mod pom;
 mod resolver;
@@ -82,5 +83,17 @@ fn run(command: Command) -> anyhow::Result<()> {
         Command::List => commands::list::run(&client),
         Command::Clean => commands::clean::run(),
         Command::Completion { shell } => commands::completion::run(&shell),
+        Command::Java { command } => match command {
+            cli::JavaCommand::List => commands::java::list(),
+            cli::JavaCommand::Install { version, vendor } => {
+                commands::java::install(&client, &version, vendor.as_deref())
+            }
+            cli::JavaCommand::Use { version, vendor } => {
+                commands::java::use_java(&version, vendor.as_deref())
+            }
+            cli::JavaCommand::Remove { version, vendor } => {
+                commands::java::remove_java(&version, vendor.as_deref())
+            }
+        },
     }
 }

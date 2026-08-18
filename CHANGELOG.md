@@ -37,6 +37,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fat-jar fix: signature files (`META-INF/*.SF`, `*.RSA`, `*.DSA`) and
   duplicate metadata (`NOTICE`, `LICENSE`, `DEPENDENCIES`) are now excluded
   when merging dependency JARs.
+- `jip java` — manage JDK installations from the command line:
+  - `jip java list` — list installed JDKs.
+  - `jip java install <version> [--vendor <name>]` — download and install a JDK.
+  - `jip java use <version> [--vendor <name>]` — set the active JDK.
+  - `jip java remove <version> [--vendor <name>]` — remove an installed JDK.
+  - Supported vendors: `zulu` (default), `temurin`, `corretto`, `graalvm`.
+- `jip java remove` clears the active JDK config when the last installed
+  JDK is removed, falling back to the system `java` on PATH.
+- GraalVM CE download URL resolver now reports a clear error when no
+  release asset exists for the current platform (e.g. macOS Intel).
 
 ### Changed
 

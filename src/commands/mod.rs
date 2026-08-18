@@ -28,6 +28,7 @@ pub mod clean;
 pub mod completion;
 pub mod init;
 pub mod jar;
+pub mod java;
 pub mod list;
 pub mod outdated;
 pub mod remove;
@@ -252,25 +253,68 @@ pub fn check_java_version(required: Option<&str>) -> anyhow::Result<()> {
     if installed_major < required_major {
         bail!(
             "this project needs Java {required}, but the installed JDK is Java {installed_major} \
-             (install a newer JDK and try again)"
+             (install a newer JDK and try again, e.g. `jip java install {required}`)"
         );
     }
     Ok(())
 }
 
-/// Query the major Java version from `java -version`.
+/// Query the major Java version — uses the active JDK if set, otherwise `java` from PATH.
 pub fn java_major_version() -> anyhow::Result<u32> {
-    let output = Command::new("java")
+    let java_path = java_binary()?;
+    let output = Command::new(&java_path)
         .arg("-version")
         .output()
-        .context("no `java` on PATH — install a JDK (e.g. via Homebrew or sdkman)")?;
+        .with_context(|| format!("failed to run {} -version", java_path.display()))?;
     let stderr = String::from_utf8_lossy(&output.stderr);
-    // Example lines: `openjdk version "21.0.2" ...` or `java version "1.8.0_392"`.
     let quoted = stderr
         .split('"')
         .nth(1)
         .context("cannot parse `java -version` output")?;
     parse_major(quoted)
+}
+
+/// Get the path to the `java` binary — active JDK first, then PATH.
+fn java_binary() -> anyhow::Result<PathBuf> {
+    if let Ok(path) = crate::jdk::active_java() {
+        return Ok(path);
+    }
+    which_java()
+}
+
+/// Get the path to the `javac` binary — active JDK first, then PATH.
+pub fn javac_binary() -> anyhow::Result<PathBuf> {
+    if let Some(active) = crate::jdk::ActiveConfig::load().ok().and_then(|c| c.active) {
+        let base = crate::jdk::jdk_base()?;
+        let javac = base
+            .join(active.vendor.to_string())
+            .join(&active.version)
+            .join("bin")
+            .join("javac");
+        if javac.exists() {
+            return Ok(javac);
+        }
+    }
+    which("javac")
+}
+
+/// Find `java` on PATH.
+fn which_java() -> anyhow::Result<PathBuf> {
+    which("java").context("no `java` on PATH — install a JDK or run `jip java install <version>`")
+}
+
+/// Find a binary on PATH.
+fn which(name: &str) -> anyhow::Result<PathBuf> {
+    let output = Command::new("which")
+        .arg(name)
+        .output()
+        .with_context(|| format!("failed to run `which {name}`"))?;
+    if output.status.success() {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Ok(PathBuf::from(path))
+    } else {
+        bail!("`{name}` not found on PATH")
+    }
 }
 
 /// Extract the major version number, e.g. `21.0.2` -> 21 and `1.8.0_392` -> 8.

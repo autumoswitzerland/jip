@@ -159,4 +159,53 @@ pub enum Command {
         /// The shell to generate completions for: `bash`, `zsh` or `fish`.
         shell: String,
     },
+
+    /// Manage JDK installations.
+    ///
+    /// Install, list, and switch between JDK versions from different vendors
+    /// (Azul Zulu, Eclipse Temurin, Amazon Corretto, GraalVM CE).
+    Java {
+        #[command(subcommand)]
+        command: JavaCommand,
+    },
+}
+
+/// Subcommands for `jip java`.
+#[derive(Debug, Subcommand)]
+pub enum JavaCommand {
+    /// List all installed JDKs.
+    List,
+
+    /// Install a JDK.
+    ///
+    /// Downloads and extracts the JDK into `~/.jip/jdks/{vendor}/{version}/`.
+    /// When no vendor is specified, Azul Zulu is used by default.
+    Install {
+        /// JDK major version to install (e.g. "21").
+        version: String,
+        /// Vendor to install from: zulu, temurin, corretto, graalvm.
+        #[arg(long)]
+        vendor: Option<String>,
+    },
+
+    /// Set the active JDK version.
+    ///
+    /// The active JDK is stored in `~/.jip/jdk.toml` and used by
+    /// `[project] java` when no system JDK is available.
+    Use {
+        /// JDK major version to activate (e.g. "21").
+        version: String,
+        /// Vendor, required when the same version is installed for multiple vendors.
+        #[arg(long)]
+        vendor: Option<String>,
+    },
+
+    /// Remove an installed JDK.
+    Remove {
+        /// JDK major version to remove (e.g. "21").
+        version: String,
+        /// Vendor, required when the same version is installed for multiple vendors.
+        #[arg(long)]
+        vendor: Option<String>,
+    },
 }
