@@ -285,8 +285,8 @@ fn merge_jar(
             continue;
         }
         let name = entry.name().to_string();
-        // Skip META-INF/MANIFEST.MF from dependencies.
-        if name.eq_ignore_ascii_case("META-INF/MANIFEST.MF") {
+        // Skip files that must not be merged from dependencies.
+        if should_skip_entry(&name) {
             continue;
         }
         if !seen.insert(name.clone()) {
@@ -297,6 +297,35 @@ fn merge_jar(
         std::io::copy(&mut entry, zip)?;
     }
     Ok(())
+}
+
+/// Whether a ZIP entry should be skipped when merging into a fat jar.
+///
+/// Signature files (*.SF, *.DSA, *.RSA) must be excluded — they belong to
+/// the original JAR's code signing and become invalid when the entry bytes
+/// change during merging.  The manifest is always regenerated, and common
+/// metadata like NOTICE/LICENSE would just produce duplicates.
+fn should_skip_entry(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    if upper == "META-INF/MANIFEST.MF" {
+        return true;
+    }
+    if upper.starts_with("META-INF/") {
+        let filename = upper.split('/').next_back().unwrap_or("");
+        // Signature files.
+        if filename.ends_with(".SF") || filename.ends_with(".DSA") || filename.ends_with(".RSA") {
+            return true;
+        }
+        // Duplicate metadata.
+        if filename == "NOTICE"
+            || filename == "LICENSE"
+            || filename == "LICENSE.TXT"
+            || filename == "DEPENDENCIES"
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// After building a thin jar, ask whether to add it to `[classpath] extra`.
@@ -556,5 +585,93 @@ mod tests {
         assert_eq!(duplicates[0], "com/example/App.class");
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn fat_jar_skips_signature_and_metadata_files() {
+        let tmp = std::env::temp_dir().join("jip-test-fat-skip");
+        let _ = fs::remove_dir_all(&tmp);
+        make_classes_dir(&tmp, &["com/example/App.class"]);
+
+        let dep_dir = tmp.join("deps");
+        fs::create_dir_all(&dep_dir).unwrap();
+        let dep_jar = dep_dir.join("signed.jar");
+        {
+            let file = fs::File::create(&dep_jar).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let options =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            zip.start_file("com/lib/Helper.class", options).unwrap();
+            zip.write_all(b"class bytes").unwrap();
+            // These should be excluded.
+            zip.start_file("META-INF/MANIFEST.MF", options).unwrap();
+            zip.write_all(b"Manifest").unwrap();
+            zip.start_file("META-INF/CERT.SF", options).unwrap();
+            zip.write_all(b"sig").unwrap();
+            zip.start_file("META-INF/CERT.RSA", options).unwrap();
+            zip.write_all(b"sig").unwrap();
+            zip.start_file("META-INF/CERT.DSA", options).unwrap();
+            zip.write_all(b"sig").unwrap();
+            zip.start_file("META-INF/NOTICE", options).unwrap();
+            zip.write_all(b"notice").unwrap();
+            zip.start_file("META-INF/LICENSE", options).unwrap();
+            zip.write_all(b"license").unwrap();
+            zip.finish().unwrap();
+        }
+
+        let fat_path = tmp.join("target/app-fat.jar");
+        let file = fs::File::create(&fat_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+
+        let mut seen = BTreeSet::new();
+        let mut duplicates = Vec::new();
+
+        let classes_dir = tmp.join("target/classes");
+        add_directory_contents_tracking(
+            &mut zip,
+            &classes_dir,
+            &classes_dir,
+            options,
+            &mut seen,
+            &mut duplicates,
+        )
+        .unwrap();
+        merge_jar(&mut zip, &dep_jar, &mut seen, &mut duplicates, options).unwrap();
+        zip.finish().unwrap();
+
+        let file = fs::File::open(&fat_path).unwrap();
+        let archive = ZipArchive::new(file).unwrap();
+        let names: Vec<String> = archive.file_names().map(|n| n.to_string()).collect();
+        assert!(names.contains(&"com/example/App.class".to_string()));
+        assert!(names.contains(&"com/lib/Helper.class".to_string()));
+        // Signature and metadata files must not be in the fat jar.
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.ends_with(".SF") || n.ends_with(".RSA") || n.ends_with(".DSA"))
+        );
+        assert!(!names.contains(&"META-INF/NOTICE".to_string()));
+        assert!(!names.contains(&"META-INF/LICENSE".to_string()));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn should_skip_signature_files() {
+        assert!(should_skip_entry("META-INF/MANIFEST.MF"));
+        assert!(should_skip_entry("META-INF/CERT.SF"));
+        assert!(should_skip_entry("META-INF/CERT.RSA"));
+        assert!(should_skip_entry("META-INF/CERT.DSA"));
+        assert!(should_skip_entry("META-INF/NOTICE"));
+        assert!(should_skip_entry("META-INF/LICENSE"));
+        assert!(should_skip_entry("META-INF/LICENSE.TXT"));
+        assert!(should_skip_entry("META-INF/DEPENDENCIES"));
+        assert!(!should_skip_entry(
+            "META-INF/services/javax.script.ScriptEngine"
+        ));
+        assert!(!should_skip_entry("com/example/App.class"));
+        assert!(!should_skip_entry("META-INF/spring.factories"));
     }
 }

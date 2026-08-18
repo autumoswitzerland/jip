@@ -77,6 +77,10 @@ fn run(command: Command) -> anyhow::Result<()> {
         Command::Test => commands::test::run(&client),
         Command::Search { query } => commands::search::run(&client, &query),
         Command::Tree => commands::tree::run(&client),
-        Command::Update => commands::update::run(&client),
+        Command::Update { dependency } => commands::update::run(&client, dependency.as_deref()),
+        Command::Outdated => commands::outdated::run(&client),
+        Command::List => commands::list::run(&client),
+        Command::Clean => commands::clean::run(),
+        Command::Completion { shell } => commands::completion::run(&shell),
     }
 }

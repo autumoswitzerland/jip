@@ -8,7 +8,7 @@
   Clone a project, run it — jip handles dependencies, compilation, and execution
   in a single binary with a single slim config file.
 
-  <img src="https://img.shields.io/badge/version-1.0.0-FFD54F">
+  <img src="https://img.shields.io/badge/version-1.1.0-FFD54F">
   <img src="https://img.shields.io/badge/license-AGPLv3-orange">
   <img src="https://img.shields.io/badge/rust-2024-blue">
 
@@ -35,6 +35,9 @@
 - **JUnit test runner** — compiles and executes tests via the JUnit Platform Console Launcher
 - **M2 cache reuse** — optionally uses `~/.m2/repository` jars instead of re-downloading
 - **Dependency tree** — compact view of resolved dependencies
+- **Upkeep commands** — `jip list`, `jip outdated`, `jip update [<dep>]`, `jip clean`, and `jip completion <shell>` keep projects tidy
+- **BOM / platform support** — Maven `<scope>import</scope>` BOMs and Gradle `platform()` / `enforcedPlatform()` are resolved during conversion
+- **Gradle version catalogs** — `gradle/libs.versions.toml` `[libraries]` + `[versions]` are resolved automatically
 
 ## Quick Start
 
@@ -80,7 +83,11 @@ jip run            # runs with the converted dependencies
 | `jip test` | Compile and run JUnit tests |
 | `jip search <query>` | Search Maven Central |
 | `jip tree` | Show the resolved dependency tree |
-| `jip update` | Bump all dependencies to their latest versions (with confirmation) |
+| `jip list` | List all resolved dependencies with versions |
+| `jip outdated` | Show which dependencies have newer versions (read-only) |
+| `jip update [<dep>]` | Bump one or all dependencies to their latest versions (with confirmation) |
+| `jip clean` | Remove `target/` build artifacts |
+| `jip completion <shell>` | Print bash/zsh/fish completions |
 
 ### `jip init`
 
@@ -132,7 +139,7 @@ jip jar --fat                        # fat jar → target/app-fat.jar (all deps 
 
 Thin jar: only the project's compiled classes. After building, jip asks whether to add the jar to `[classpath] extra`.
 
-Fat jar: all dependency jars are unpacked and merged into a single uber jar. Duplicate resources are overwritten (last-wins) with a warning listing affected files.
+Fat jar: all dependency jars are unpacked and merged into a single uber jar. Signature files (`.SF`, `.RSA`, `.DSA`) and duplicate metadata (`NOTICE`, `LICENSE`) from dependencies are excluded. Duplicate resources are overwritten (last-wins) with a warning listing affected files.
 
 ### `jip test`
 
@@ -143,9 +150,19 @@ jip add org.junit.platform:junit-platform-console-standalone --test
 jip test
 ```
 
+### `jip outdated`
+
+Read-only check for newer versions. Lists every direct dependency that is behind, with its installed and latest version:
+
+```
+com.google.guava:guava: 33.0.0-jre -> 33.4.0-jre
+```
+
+Nothing is written — `jip.toml` and `jip.lock` stay untouched.
+
 ### `jip update`
 
-Checks every direct dependency for a newer version on Maven Central and shows what would change. Prompts for confirmation before applying:
+Checks direct dependencies for a newer version on Maven Central and shows what would change. Prompts for confirmation before applying:
 
 ```
 com.google.guava:guava: 33.0.0-jre -> 33.4.0-jre
@@ -153,7 +170,40 @@ org.slf4j:slf4j-api: 2.0.13 -> 2.0.16
 update 2 dependencies to the versions listed above? [y/N]
 ```
 
+With a `group:artifact` argument only that single dependency is updated instead of everything:
+
+```bash
+jip update org.slf4j:slf4j-api
+```
+
 Without a terminal, `jip update` refuses to run to prevent unintended version bumps in CI.
+
+### `jip list`
+
+Prints every resolved dependency with its pinned version from `jip.lock`, grouped by scope:
+
+```
+dependencies:
+  org.yaml:snakeyaml = 2.6
+provided-dependencies:
+  jakarta.servlet:jakarta.servlet-api = 6.1.0
+test-dependencies:
+  org.junit.platform:junit-platform-console-standalone = 1.13.0-M3
+```
+
+### `jip clean`
+
+Removes the `target/` directory with all build artifacts (classes, tests, jars). Sources, `jip.toml` and `jip.lock` are left alone.
+
+### `jip completion`
+
+Prints a completion script for the given shell, generated from the command definition so it always matches the installed version:
+
+```bash
+jip completion bash >> ~/.bashrc
+jip completion zsh >> ~/.zshrc
+jip completion fish > ~/.config/fish/completions/jip.fish
+```
 
 ## Configuration
 
@@ -227,8 +277,47 @@ Custom Maven repositories tried before Maven Central. Keys are arbitrary names, 
 | Maven `<repositories>`/Gradle `maven { url = ... }` | `[repositories]` |
 | Maven `maven-compiler-plugin` `<release>`/`<source>` | `[project] java` |
 | Gradle `toolchain.languageVersion` / `sourceCompatibility` / `targetCompatibility` | `[project] java` |
+| Maven `<dependencyManagement>` BOM imports / Gradle `platform(...)` | resolved inline |
+| Gradle `gradle/libs.versions.toml` | resolved inline |
 
 Optional and system-scoped dependencies are skipped. Original `pom.xml` / `build.gradle` files are never modified.
+
+### BOM / platform resolution
+
+When a Maven POM imports a BOM (`<dependencyManagement>` with `<type>pom</type><scope>import</scope>`), or a Gradle build script declares `platform(...)` / `enforcedPlatform(...)`, jip downloads the BOM POM and applies its managed versions to version-less dependencies.
+
+**Version priority** (highest wins):
+
+1. Explicit `group:artifact:version` in the declaration
+2. Version catalog (`libs.x` accessor)
+3. `platform(...)` / Maven BOM
+4. `latest_version` fallback
+
+**Maven semantics:** among several BOM imports the last one wins. Local `<dependencyManagement>` entries always win over imports.
+
+**Gradle scope inheritance:** `implementation platform(...)` also applies to `testImplementation` dependencies (Gradle configuration hierarchy).
+
+**Nesting:** BOMs are resolved only one level deep — a BOM that imports another BOM is not followed further.
+
+### Gradle version catalogs
+
+When `gradle/libs.versions.toml` exists, jip resolves `libs.<alias>` accessors to their `group:artifact:version` coordinates. Only `[libraries]` and `[versions]` sections are used; `[bundles]` and `[plugins]` are ignored.
+
+```toml
+# gradle/libs.versions.toml
+[versions]
+junit = "5.10.0"
+
+[libraries]
+junit = { group = "org.junit.jupiter", name = "junit-jupiter", version.ref = "junit" }
+```
+
+```groovy
+// build.gradle — jip resolves libs.junit to org.junit.jupiter:junit-jupiter:5.10.0
+dependencies {
+    testImplementation(libs.junit)
+}
+```
 
 ### Java version detection
 

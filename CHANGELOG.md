@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-08-18
+
+### Added
+
+- `jip clean` — removes `target/` build artifacts.
+- `jip list` — lists all resolved dependencies with pinned versions from
+  `jip.lock`, grouped by scope.
+- `jip outdated` — read-only check showing which direct dependencies have
+  newer versions available on Maven Central.
+- `jip update [<dep>]` — updates one or all direct dependencies to the
+  latest version, with interactive confirmation (refuses without a terminal).
+- `jip completion <shell>` — prints bash/zsh/fish completions to stdout.
+- BOM / dependency-management import during conversion:
+  - Maven `<dependencyManagement>` imports (`<type>pom</type><scope>import</scope>`)
+    are downloaded and their managed versions applied to version-less
+    `<dependencies>`.  Last import wins (Maven semantics).
+  - Gradle `platform(...)` and `enforcedPlatform(...)` BOMs are resolved
+    and applied to version-less dependencies.  Runtime platforms also
+    apply to test dependencies (Gradle configuration inheritance).
+- Gradle version catalog support (`gradle/libs.versions.toml`):
+  - `[libraries]` entries with `group`, `name` (or `artifact`), and
+    `version` (or `version.ref` into `[versions]`).
+  - `libs.<alias>` accessor syntax in build scripts is resolved to
+    coordinates, with camelCase-to-kebab fallback.
+- Version priority (highest wins):
+  1. Explicit `group:artifact:version` in the declaration
+  2. Version catalog (`libs.x` accessor)
+  3. `platform(...)` / Maven BOM
+  4. `latest_version` fallback (in `convert_to_config`)
+- Fat-jar fix: signature files (`META-INF/*.SF`, `*.RSA`, `*.DSA`) and
+  duplicate metadata (`NOTICE`, `LICENSE`, `DEPENDENCIES`) are now excluded
+  when merging dependency JARs.
+
+### Changed
+
+- `collect_dependencies` now takes a `&reqwest::blocking::Client` to
+  download BOM/platform POMs during conversion.
+- Maven `PomDependency` carries an optional `typ` field (`<type>` element)
+  to detect BOM imports (`type=pom`).
+
 ## [1.0.0] - 2026-08-17
 
 ### Added

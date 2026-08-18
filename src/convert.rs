@@ -41,12 +41,14 @@ use std::sync::OnceLock;
 use anyhow::{Context, bail};
 use regex::Regex;
 
+use crate::cache::download_repo_text;
 use crate::central;
 use crate::commands::build::{self, MainDecision, MainTarget};
 use crate::commands::{resolve, resolve_provided, resolve_tests, write_lock};
 use crate::config::{CONFIG_FILE, CacheSettings, ProjectConfig, ProjectSettings};
 use crate::lock::LOCK_FILE;
 use crate::pom::{Pom, PomDependency, is_runtime_dependency, parse_pom};
+use crate::resolver::{DEFAULT_REPO_URL, interpolate};
 
 /// The kind of build system a project uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,24 +113,34 @@ pub fn detect() -> Option<ProjectType> {
 }
 
 /// Read and convert all dependencies of the detected project.
-pub fn collect_dependencies(project_type: ProjectType) -> anyhow::Result<ConvertedDependencies> {
+///
+/// Uses the repositories (custom first, Maven Central last) to resolve the
+/// `<dependencyManagement>` of every imported Maven BOM and every Gradle
+/// `platform(...)` declaration, so version-less dependencies get their pins.
+pub fn collect_dependencies(
+    client: &reqwest::blocking::Client,
+    project_type: ProjectType,
+) -> anyhow::Result<ConvertedDependencies> {
+    let repos = repositories_from_files(project_type);
     match project_type {
         ProjectType::Maven => {
             let xml = fs::read_to_string("pom.xml").context("cannot read pom.xml")?;
             let pom = parse_pom(&xml)?;
+            let (properties, managed) = maven_context(&pom);
+            let managed = merge_bom_imports(client, &repos, &pom, &properties, managed)?;
             Ok(ConvertedDependencies {
-                runtime: maven_dependencies_from_xml(&xml)?,
-                provided: maven_provided_dependencies_from_xml(&xml)?,
-                test: maven_test_dependencies_from_xml(&xml)?,
+                runtime: collect_scope(&pom, &properties, &managed, is_runtime_dependency),
+                provided: collect_scope(&pom, &properties, &managed, |d| d.scope == "provided"),
+                test: collect_scope(&pom, &properties, &managed, |d| d.scope == "test"),
                 repositories: maven_repositories_from_xml(&pom),
             })
         }
         ProjectType::GradleGroovy => {
             let content = fs::read_to_string("build.gradle").context("cannot read build.gradle")?;
-            let (runtime, test) = gradle_dependencies_from_content(&content)?;
+            let (runtime, test) = gradle_dependencies(client, &repos, &content)?;
             Ok(ConvertedDependencies {
                 runtime,
-                provided: gradle_provided_dependencies_from_content(&content)?,
+                provided: gradle_provided_dependencies(&content)?,
                 test,
                 repositories: gradle_repositories_from_content(&content),
             })
@@ -136,10 +148,10 @@ pub fn collect_dependencies(project_type: ProjectType) -> anyhow::Result<Convert
         ProjectType::GradleKotlin => {
             let content =
                 fs::read_to_string("build.gradle.kts").context("cannot read build.gradle.kts")?;
-            let (runtime, test) = gradle_dependencies_from_content(&content)?;
+            let (runtime, test) = gradle_dependencies(client, &repos, &content)?;
             Ok(ConvertedDependencies {
                 runtime,
-                provided: gradle_provided_dependencies_from_content(&content)?,
+                provided: gradle_provided_dependencies(&content)?,
                 test,
                 repositories: gradle_repositories_from_content(&content),
             })
@@ -147,11 +159,118 @@ pub fn collect_dependencies(project_type: ProjectType) -> anyhow::Result<Convert
     }
 }
 
+/// The repository list used by the conversion: the URLs from the build file,
+/// with Maven Central appended last.
+fn repositories_from_files(project_type: ProjectType) -> Vec<String> {
+    let mut repos = match project_type {
+        ProjectType::Maven => fs::read_to_string("pom.xml")
+            .ok()
+            .and_then(|xml| parse_pom(&xml).ok())
+            .map(|pom| {
+                maven_repositories_from_xml(&pom)
+                    .into_values()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+        ProjectType::GradleGroovy => fs::read_to_string("build.gradle")
+            .ok()
+            .map(|content| {
+                gradle_repositories_from_content(&content)
+                    .into_values()
+                    .collect()
+            })
+            .unwrap_or_default(),
+        ProjectType::GradleKotlin => fs::read_to_string("build.gradle.kts")
+            .ok()
+            .map(|content| {
+                gradle_repositories_from_content(&content)
+                    .into_values()
+                    .collect()
+            })
+            .unwrap_or_default(),
+    };
+    repos.push(DEFAULT_REPO_URL.to_string());
+    repos
+}
+
+/// Collect the versions a Maven project inherits from every imported BOM
+/// (`<type>pom</type>` + `<scope>import</scope>`) and merge them into the
+/// local `<dependencyManagement>` map.
+///
+/// Priority rules (Maven semantics): the POM's own `<dependencyManagement>`
+/// always wins over imports, and among several imports the last one wins.
+/// BOM POMs are downloaded one level deep — a BOM that imports another BOM
+/// is not followed further.
+fn merge_bom_imports(
+    client: &reqwest::blocking::Client,
+    repos: &[String],
+    pom: &Pom,
+    properties: &HashMap<String, String>,
+    mut managed: HashMap<(String, String), String>,
+) -> anyhow::Result<HashMap<(String, String), String>> {
+    let mut imported: HashMap<(String, String), String> = HashMap::new();
+    for dep in &pom.managed_dependencies {
+        let is_import = dep.typ.as_deref() == Some("pom") && dep.scope == "import";
+        if !is_import {
+            continue;
+        }
+        let group = interpolate(&dep.group_id, properties);
+        let artifact = interpolate(&dep.artifact_id, properties);
+        let Some(version) = dep.version.as_deref() else {
+            continue;
+        };
+        let version = interpolate(version, properties);
+        let Some(pom) = download_bom_pom(client, repos, &group, &artifact, &version)? else {
+            println!(
+                "  {} imported BOM {group}:{artifact}:{version} not found — its versions are not applied",
+                crate::console::yellow("warning:")
+            );
+            continue;
+        };
+        let (_, bom_managed) = maven_context(&pom);
+        for (key, value) in bom_managed {
+            // Later imports overwrite earlier ones.
+            imported.insert(key, value);
+        }
+    }
+    // Local <dependencyManagement> entries win over imported ones.
+    for (key, value) in imported {
+        managed.entry(key).or_insert(value);
+    }
+    Ok(managed)
+}
+
+/// Download and parse a BOM POM (`type=pom`) from the repositories.
+fn download_bom_pom(
+    client: &reqwest::blocking::Client,
+    repos: &[String],
+    group: &str,
+    artifact: &str,
+    version: &str,
+) -> anyhow::Result<Option<Pom>> {
+    let relative_path = format!(
+        "{}/{}/{}/{}-{}.pom",
+        group.replace('.', "/"),
+        artifact,
+        version,
+        artifact,
+        version
+    );
+    for repo in repos {
+        match download_repo_text(client, repo, &relative_path) {
+            Ok(xml) => return parse_pom(&xml).map(Some),
+            Err(_) => continue,
+        }
+    }
+    Ok(None)
+}
+
 /// Extract the runtime dependencies from a `pom.xml`.
 ///
 /// Versions are taken from the `<dependency>` element or, when missing,
 /// from `<dependencyManagement>` in the same POM.  `${...}` placeholders
 /// are substituted using the POM's own properties.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn maven_dependencies_from_xml(xml: &str) -> anyhow::Result<Vec<ConvertedDependency>> {
     let pom = parse_pom(xml)?;
     let (properties, managed) = maven_context(&pom);
@@ -162,6 +281,7 @@ pub fn maven_dependencies_from_xml(xml: &str) -> anyhow::Result<Vec<ConvertedDep
 
 /// Extract the `provided`-scope dependencies, which are required to compile
 /// but never land on the runtime classpath.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn maven_provided_dependencies_from_xml(xml: &str) -> anyhow::Result<Vec<ConvertedDependency>> {
     let pom = parse_pom(xml)?;
     let (properties, managed) = maven_context(&pom);
@@ -172,6 +292,7 @@ pub fn maven_provided_dependencies_from_xml(xml: &str) -> anyhow::Result<Vec<Con
 
 /// Extract the test-scope dependencies from a `pom.xml` the same way as the
 /// runtime ones, e.g. `junit:junit:4.13.2`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn maven_test_dependencies_from_xml(xml: &str) -> anyhow::Result<Vec<ConvertedDependency>> {
     let pom = parse_pom(xml)?;
     let (properties, managed) = maven_context(&pom);
@@ -285,6 +406,7 @@ const COMPILE_ONLY_CONFIGURATIONS: [&str; 2] = ["compileOnly", "compileOnlyApi"]
 /// The return value is `(runtime, test)` split by configuration.
 /// Multi-line declarations and version catalogs (`libs.versions.*`) are not
 /// supported and are simply skipped.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn gradle_dependencies_from_content(
     content: &str,
 ) -> anyhow::Result<(Vec<ConvertedDependency>, Vec<ConvertedDependency>)> {
@@ -336,6 +458,7 @@ pub fn gradle_dependencies_from_content(
 /// Extract `compileOnly` dependencies from a `build.gradle`/`.kts`, Gradle's
 /// compile-only configuration.  Only the shorthand
 /// `compileOnly 'group:artifact:version'` style is recognised.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn gradle_provided_dependencies_from_content(
     content: &str,
 ) -> anyhow::Result<Vec<ConvertedDependency>> {
@@ -354,6 +477,323 @@ pub fn gradle_provided_dependencies_from_content(
                 (caps.get(3), caps.get(4), caps.get(5))
         {
             provided.push(convert(group.as_str(), artifact.as_str(), version.as_str()));
+        }
+    }
+    Ok(provided)
+}
+
+/// The result of parsing a version catalog file.
+///
+/// Maps every `libs.x` accessor alias to its coordinates.  The version is
+/// `None` when the library entry carries no version (e.g. a BOM alias used
+/// by `platform(...)`).
+type VersionCatalog = HashMap<String, (String, String, Option<String>)>;
+
+/// Read `gradle/libs.versions.toml` when present, mapping each `[libraries]`
+/// alias to `(group, artifact, Optional<version>)`.  Versions are resolved
+/// from the `[versions]` table through `version.ref`.
+fn load_version_catalog() -> Option<VersionCatalog> {
+    let raw = fs::read_to_string("gradle/libs.versions.toml").ok()?;
+    parse_version_catalog(&raw)
+}
+
+/// Parse the content of `gradle/libs.versions.toml` into the alias map.
+///
+/// Entries without a `group`/`name` (or `artifact`) column are skipped, as
+/// are any whose `version.ref` has no matching `[versions]` entry.
+fn parse_version_catalog(raw: &str) -> Option<VersionCatalog> {
+    let value: toml::Value = toml::from_str(raw).ok()?;
+    let versions = value.get("versions").and_then(toml::Value::as_table)?;
+    let libraries = value.get("libraries").and_then(toml::Value::as_table)?;
+    let catalog = libraries
+        .iter()
+        .filter_map(|(alias, entry)| {
+            let table = entry.as_table()?;
+            let group = table.get("group")?.as_str()?;
+            let artifact = table
+                .get("name")
+                .or_else(|| table.get("artifact"))?
+                .as_str()?;
+            let version = table
+                .get("version")
+                .and_then(toml::Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    // `version.ref = "junit"` (or `version = { ref = "junit" }`)
+                    // is parsed as a nested `version` table by the TOML crate.
+                    table
+                        .get("version")
+                        .and_then(toml::Value::as_table)
+                        .and_then(|t| t.get("ref"))
+                        .and_then(toml::Value::as_str)
+                        .and_then(|name| {
+                            versions
+                                .get(name)
+                                .and_then(toml::Value::as_str)
+                                .map(str::to_string)
+                        })
+                });
+            Some((
+                alias.clone(),
+                (group.to_string(), artifact.to_string(), version),
+            ))
+        })
+        .collect();
+    Some(catalog)
+}
+
+/// Extract the runtime and test dependencies from a Gradle build script,
+/// resolving `platform(...)` BOMs and version-catalog accessors.
+///
+/// Priority for picking a version (highest first):
+///   1. explicit `group:artifact:version` in the declaration
+///   2. version catalog (`libs.x` accessor)
+///   3. `platform(...)` / `enforcedPlatform(...)` BOM
+///   4. `latest_version` fallback (in `convert_to_config`)
+pub fn gradle_dependencies(
+    client: &reqwest::blocking::Client,
+    repos: &[String],
+    content: &str,
+) -> anyhow::Result<(Vec<ConvertedDependency>, Vec<ConvertedDependency>)> {
+    let catalog = load_version_catalog();
+    let configurations = RUNTIME_CONFIGURATIONS
+        .iter()
+        .chain(&TEST_CONFIGURATIONS)
+        .copied()
+        .collect::<Vec<_>>()
+        .join("|");
+
+    // `implementation platform("g:a:v")` / `implementation(platform(...))`,
+    // Groovy and Kotlin.
+    let platform = Regex::new(&format!(
+        r#"^\s*({configurations})\s*(\(\s*)?(enforced)?platform\(\s*["']([^"']+)["']\s*\)\s*\)?"#
+    ))?;
+    // Shorthand with a version: `implementation 'g:a:v'`.
+    let shorthand = Regex::new(&format!(
+        r#"^\s*({configurations})\s*(\(\s*)?['"]([^:'"]+):([^:'"]+):([^'"]+)['"]"#
+    ))?;
+    // Shorthand without a version: `implementation 'g:a'` (needs a BOM).
+    let versionless = Regex::new(&format!(
+        r#"^\s*({configurations})\s*(\(\s*)?['"]([^:'"]+):([^:'"]+)['"]"#
+    ))?;
+    // Catalog accessor: `implementation(libs.guava)`.
+    let accessor = Regex::new(&format!(
+        r#"^\s*({configurations})\s*(\(\s*)?libs\.([A-Za-z0-9_.-]+)\s*\)?"#
+    ))?;
+    // Named argument style (with a version), e.g.
+    //   implementation group: 'g', name: 'a', version: 'v'
+    //   implementation(group = "g", name = "a", version = "v")
+    let groovy_named = Regex::new(
+        r#"^\s*(implementation|api|runtimeOnly|compile)\s*(\(\s*)?group:\s*['"]([^'"]+)['"],\s*name:\s*['"]([^'"]+)['"],\s*version:\s*['"]([^'"]+)['"]"#,
+    )?;
+    let kotlin_named = Regex::new(
+        r#"^\s*(implementation|api|runtimeOnly|compile)\s*\(\s*group\s*=\s*"([^"]+)",\s*name\s*=\s*"([^"]+)",\s*version\s*=\s*"([^"]+)""#,
+    )?;
+
+    let mut runtime = Vec::new();
+    let mut test = Vec::new();
+    let mut runtime_platforms = Vec::new();
+    let mut test_platforms = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("//") || trimmed.starts_with("/*") {
+            continue;
+        }
+
+        if let Some(caps) = platform.captures(trimmed) {
+            let is_test = TEST_CONFIGURATIONS.contains(&caps.get(1).unwrap().as_str());
+            if let Some(coords) = caps.get(4) {
+                let dep = parse_coordinates(coords.as_str());
+                if let Some(dep) = dep {
+                    if is_test {
+                        test_platforms.push(dep);
+                    } else {
+                        runtime_platforms.push(dep);
+                    }
+                }
+            }
+            continue;
+        }
+
+        if let Some((dep, is_test)) = match_shorthand(trimmed, &shorthand) {
+            if is_test {
+                test.push(dep);
+            } else {
+                runtime.push(dep);
+            }
+            continue;
+        }
+
+        if let Some(caps) = versionless.captures(trimmed) {
+            let is_test = TEST_CONFIGURATIONS.contains(&caps.get(1).unwrap().as_str());
+            let group = caps.get(3).unwrap().as_str().to_string();
+            let artifact = caps.get(4).unwrap().as_str().to_string();
+            let dep = ConvertedDependency {
+                group,
+                artifact,
+                version: None,
+            };
+            if is_test {
+                test.push(dep);
+            } else {
+                runtime.push(dep);
+            }
+            continue;
+        }
+
+        if let Some(caps) = accessor.captures(trimmed) {
+            let is_test = TEST_CONFIGURATIONS.contains(&caps.get(1).unwrap().as_str());
+            let alias = caps.get(3).unwrap().as_str();
+            match resolve_catalog_accessor(&catalog, alias) {
+                Some(dep) if is_test => test.push(dep),
+                Some(dep) => runtime.push(dep),
+                None => println!(
+                    "  {} version catalog accessor libs.{alias} not found — skipped",
+                    crate::console::yellow("warning:")
+                ),
+            }
+            continue;
+        }
+
+        // Named argument style.
+        if let Some(dep) = match_named(trimmed, &groovy_named, &kotlin_named) {
+            runtime.push(dep);
+        }
+    }
+
+    // In Gradle, `implementation platform(...)` also applies to
+    // `testImplementation` (test extends implementation).
+    let runtime_versions = resolve_platforms(client, repos, &runtime_platforms)?;
+    let test_versions = resolve_platforms(client, repos, &test_platforms)?;
+    apply_platform_versions(&mut runtime, &runtime_versions);
+    apply_platform_versions(&mut test, &runtime_versions);
+    apply_platform_versions(&mut test, &test_versions);
+
+    Ok((runtime, test))
+}
+
+/// Parse `group:artifact:version` into a dependency, or `None` when the
+/// string is not a full `g:a:v` triple.
+fn parse_coordinates(coords: &str) -> Option<ConvertedDependency> {
+    let mut parts = coords.splitn(3, ':');
+    let group = parts.next()?;
+    let artifact = parts.next()?;
+    let version = parts.next()?;
+    if group.is_empty() || artifact.is_empty() || version.is_empty() {
+        return None;
+    }
+    Some(ConvertedDependency {
+        group: group.to_string(),
+        artifact: artifact.to_string(),
+        version: Some(version.to_string()),
+    })
+}
+
+/// Resolve a `libs.alias` accessor against the version catalog.  The alias
+/// may be nested (`libs.spring.boot`) or kebab-cased (`libs.jakarta-servlet`).
+fn resolve_catalog_accessor(
+    catalog: &Option<VersionCatalog>,
+    alias: &str,
+) -> Option<ConvertedDependency> {
+    let alias = alias.strip_prefix("libs.").unwrap_or(alias);
+    let catalog = catalog.as_ref()?;
+    let key = catalog.get(alias).or_else(|| {
+        // `libs.jakartaServletApi` -> catalog key `jakarta-servlet-api`.
+        let kebab = camel_to_kebab(alias);
+        catalog.get(&kebab)
+    })?;
+    Some(ConvertedDependency {
+        group: key.0.clone(),
+        artifact: key.1.clone(),
+        version: key.2.clone(),
+    })
+}
+
+/// Convert a camelCase accessor segment to the catalog's kebab-case key form.
+fn camel_to_kebab(input: &str) -> String {
+    let mut out = String::new();
+    for c in input.chars() {
+        if c.is_ascii_uppercase() && !out.is_empty() {
+            out.push('-');
+        }
+        out.extend(c.to_lowercase());
+    }
+    out
+}
+
+/// Download every `platform(...)` POM and collect its `<dependencyManagement>`
+/// versions, keyed by `(group, artifact)`.
+fn resolve_platforms(
+    client: &reqwest::blocking::Client,
+    repos: &[String],
+    platforms: &[ConvertedDependency],
+) -> anyhow::Result<HashMap<(String, String), String>> {
+    let mut versions = HashMap::new();
+    for platform in platforms {
+        let Some(version) = platform.version.as_deref() else {
+            continue;
+        };
+        if let Some(pom) =
+            download_bom_pom(client, repos, &platform.group, &platform.artifact, version)?
+        {
+            let (_, managed) = maven_context(&pom);
+            versions.extend(managed);
+        } else {
+            println!(
+                "  {} platform {}:{version} not found — its versions are not applied",
+                crate::console::yellow("warning:"),
+                platform.key()
+            );
+        }
+    }
+    Ok(versions)
+}
+
+/// Fill version-less dependencies from the platform-provided `<dependencyManagement>`.
+fn apply_platform_versions(
+    deps: &mut [ConvertedDependency],
+    platform_versions: &HashMap<(String, String), String>,
+) {
+    for dep in deps.iter_mut() {
+        if dep.version.is_some() {
+            continue;
+        }
+        if let Some(version) = platform_versions.get(&(dep.group.clone(), dep.artifact.clone())) {
+            dep.version = Some(version.clone());
+        }
+    }
+}
+
+/// Extract `compileOnly` dependencies from a Gradle build script, with
+/// version-catalog accessors.  Platforms are not tracked for `compileOnly`
+/// — the declared version (or catalog version) is used directly.
+pub fn gradle_provided_dependencies(content: &str) -> anyhow::Result<Vec<ConvertedDependency>> {
+    let catalog = load_version_catalog();
+    let configurations = COMPILE_ONLY_CONFIGURATIONS.join("|");
+    let shorthand = Regex::new(&format!(
+        r#"^\s*({configurations})\s*(\(\s*)?['"]([^:'"]+):([^:'"]+):([^'"]+)['"]"#
+    ))?;
+    let accessor = Regex::new(&format!(
+        r#"^\s*({configurations})\s*(\(\s*)?libs\.([A-Za-z0-9_.-]+)\s*\)?"#
+    ))?;
+    let mut provided = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("//") || trimmed.starts_with("/*") {
+            continue;
+        }
+        if let Some(caps) = shorthand.captures(trimmed)
+            && let (Some(group), Some(artifact), Some(version)) =
+                (caps.get(3), caps.get(4), caps.get(5))
+        {
+            provided.push(convert(group.as_str(), artifact.as_str(), version.as_str()));
+            continue;
+        }
+        if let Some(caps) = accessor.captures(trimmed)
+            && let Some(dep) = resolve_catalog_accessor(&catalog, caps.get(3).unwrap().as_str())
+        {
+            provided.push(dep);
         }
     }
     Ok(provided)
@@ -560,7 +1000,7 @@ pub fn convert_project(client: &reqwest::blocking::Client) -> anyhow::Result<Pro
     };
 
     if let Some(project_type) = project_type {
-        let converted = collect_dependencies(project_type)?;
+        let converted = collect_dependencies(client, project_type)?;
         let repos = crate::commands::repositories_for(&config);
         let provided_count = converted.provided.len();
         config.dependencies = convert_to_config(client, &repos, converted.runtime)?;
@@ -1184,5 +1624,297 @@ mod tests {
         "#;
         let repos = gradle_repositories_from_content(script);
         assert!(repos.is_empty());
+    }
+
+    #[test]
+    fn maven_bom_import_is_detected() {
+        let xml = r#"
+            <project>
+              <groupId>com.example</groupId>
+              <artifactId>demo</artifactId>
+              <version>1.0.0</version>
+              <dependencyManagement>
+                <dependencies>
+                  <dependency>
+                    <groupId>org.springframework.boot</groupId>
+                    <artifactId>spring-boot-dependencies</artifactId>
+                    <version>3.2.0</version>
+                    <type>pom</type>
+                    <scope>import</scope>
+                  </dependency>
+                </dependencies>
+              </dependencyManagement>
+            </project>
+        "#;
+        let pom = parse_pom(xml).unwrap();
+        let import = &pom.managed_dependencies[0];
+        assert_eq!(import.typ.as_deref(), Some("pom"));
+        assert_eq!(import.scope, "import");
+    }
+
+    #[test]
+    fn parse_version_catalog_resolves_version_ref() {
+        let raw = r#"
+            [versions]
+            junit = "5.10.0"
+            slf4j = "2.0.13"
+
+            [libraries]
+            junit = { group = "org.junit.jupiter", name = "junit-jupiter", version.ref = "junit" }
+            slf4j = { group = "org.slf4j", name = "slf4j-api", version = "2.0.13" }
+            bom = { group = "org.springframework.boot", name = "spring-boot-bom", version.ref = "slf4j" }
+        "#;
+        let catalog = parse_version_catalog(raw).expect("eligible catalog");
+        assert_eq!(
+            catalog.get("junit"),
+            Some(&(
+                "org.junit.jupiter".to_string(),
+                "junit-jupiter".to_string(),
+                Some("5.10.0".to_string())
+            ))
+        );
+        assert_eq!(catalog.get("slf4j").unwrap().2.as_deref(), Some("2.0.13"));
+        assert_eq!(catalog.get("bom").unwrap().2.as_deref(), Some("2.0.13"));
+    }
+
+    #[test]
+    fn catalog_accessor_maps_camel_case_to_kebab() {
+        let alias = "springBootStarterWeb";
+        assert_eq!(camel_to_kebab(alias), "spring-boot-starter-web");
+        assert_eq!(camel_to_kebab("guava"), "guava");
+    }
+
+    #[test]
+    fn unknown_catalog_accessor_is_none() {
+        let catalog = parse_version_catalog(
+            "[versions]\nj = \"1.0\"\n[libraries]\nguava = { group = \"g\", name = \"a\", version = \"1.0\" }",
+        );
+        let dep = resolve_catalog_accessor(&catalog, "libs.missing");
+        assert!(dep.is_none());
+    }
+
+    #[test]
+    fn gradle_platform_resolves_versions_from_local_repo() {
+        // A local Maven-style repo with a platform POM.  `platform(...)` is
+        // resolved and version-less dependencies pick up the pin.
+        let dir = std::env::temp_dir().join(format!("jip-platform-{}", std::process::id()));
+        let platform_dir = dir.join("repo/com/example/platform/1.0.0");
+        std::fs::create_dir_all(&platform_dir).unwrap();
+        std::fs::write(
+            platform_dir.join("platform-1.0.0.pom"),
+            r#"
+                <project>
+                  <groupId>com.example</groupId>
+                  <artifactId>platform</artifactId>
+                  <version>1.0.0</version>
+                  <dependencyManagement>
+                    <dependencies>
+                      <dependency>
+                        <groupId>com.example</groupId>
+                        <artifactId>widget</artifactId>
+                        <version>3.3.3</version>
+                      </dependency>
+                    </dependencies>
+                  </dependencyManagement>
+                </project>
+            "#,
+        )
+        .unwrap();
+
+        let repo_url = format!("file://{}", dir.join("repo").display());
+        let client = reqwest::blocking::Client::new();
+        let script = r#"
+            dependencies {
+                implementation platform("com.example:platform:1.0.0")
+                implementation 'com.example:widget'
+                testImplementation platform("com.example:test-platform:1.0.0")
+                testImplementation 'com.example:missing-anything'
+            }
+        "#;
+        let (runtime, test) = gradle_dependencies(&client, &[repo_url], script).unwrap();
+        // Test platform POM is absent -> test side stays version-less.
+        assert_eq!(test.len(), 1);
+        assert_eq!(test[0].version, None);
+        // Runtime platform POM was found -> widget gets 3.3.3.
+        assert_eq!(test[0].key(), "com.example:missing-anything");
+        assert_eq!(runtime.len(), 1);
+        assert_eq!(runtime[0].key(), "com.example:widget");
+        assert_eq!(runtime[0].version.as_deref(), Some("3.3.3"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gradle_explicit_version_beats_platform() {
+        // Explicit version is priority 1: it must survive the BOM fill.
+        let dir = std::env::temp_dir().join(format!("jip-platform-prio-{}", std::process::id()));
+        let platform_dir = dir.join("repo/com/example/platform/1.0.0");
+        std::fs::create_dir_all(&platform_dir).unwrap();
+        std::fs::write(
+            platform_dir.join("platform-1.0.0.pom"),
+            r#"
+                <project>
+                  <groupId>com.example</groupId>
+                  <artifactId>platform</artifactId>
+                  <version>1.0.0</version>
+                  <dependencyManagement>
+                    <dependencies>
+                      <dependency>
+                        <groupId>com.example</groupId>
+                        <artifactId>widget</artifactId>
+                        <version>3.3.3</version>
+                      </dependency>
+                    </dependencies>
+                  </dependencyManagement>
+                </project>
+            "#,
+        )
+        .unwrap();
+
+        let repo_url = format!("file://{}", dir.join("repo").display());
+        let client = reqwest::blocking::Client::new();
+        let script = r#"
+            dependencies {
+                implementation platform("com.example:platform:1.0.0")
+                implementation 'com.example:widget:9.9.9'
+            }
+        "#;
+        let (runtime, _) = gradle_dependencies(&client, &[repo_url], script).unwrap();
+        assert_eq!(runtime.len(), 1);
+        assert_eq!(runtime[0].version.as_deref(), Some("9.9.9"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gradle_accessor_resolves_from_catalog() {
+        // Pure path: accessor regex + catalog lookup + ConvertedDependency.
+        let catalog = parse_version_catalog(
+            r#"
+                [versions]
+                junit = "5.10.0"
+                [libraries]
+                junit = { group = "org.junit.jupiter", name = "junit-jupiter", version.ref = "junit" }
+            "#,
+        );
+        let alias = Regex::new(r#"^\s*testImplementation\s*(\(\s*)?libs\.([A-Za-z0-9_.-]+)\s*\)?"#)
+            .unwrap();
+        let line = "testImplementation(libs.junit)";
+        let caps = alias.captures(line.trim()).unwrap();
+        let dep = resolve_catalog_accessor(&catalog, caps.get(2).unwrap().as_str()).unwrap();
+        assert_eq!(dep.key(), "org.junit.jupiter:junit-jupiter");
+        assert_eq!(dep.version.as_deref(), Some("5.10.0"));
+    }
+
+    #[test]
+    fn versionless_shorthand_is_kept_for_bom_resolution() {
+        let script = r#"
+            dependencies {
+                implementation 'com.example:widget'
+                implementation 'com.other:thing:1.2.3'
+            }
+        "#;
+        // No platforms declared -> empty local repo, version-less dep survives
+        // for the later BOM/`latest_version` step.
+        let (runtime, _) =
+            gradle_dependencies(&reqwest::blocking::Client::new(), &[], script).unwrap();
+        assert_eq!(runtime.len(), 2);
+        assert_eq!(runtime[0].version, None); // resolved later via BOM
+        assert_eq!(runtime[1].version.as_deref(), Some("1.2.3"));
+    }
+
+    #[test]
+    fn bom_merge_imports_last_one_wins() {
+        // Build a tiny local Maven-style repo with two BOM POMs.
+        let dir = std::env::temp_dir().join(format!("jip-bom-{}", std::process::id()));
+        let repo_a = dir.join("repo/com/example/boma/1.0.0");
+        let repo_b = dir.join("repo/com/example/bomb/1.0.0");
+        std::fs::create_dir_all(&repo_a).unwrap();
+        std::fs::create_dir_all(&repo_b).unwrap();
+        std::fs::write(
+            repo_a.join("boma-1.0.0.pom"),
+            r#"
+                <project>
+                  <groupId>com.example</groupId>
+                  <artifactId>boma</artifactId>
+                  <version>1.0.0</version>
+                  <dependencyManagement>
+                    <dependencies>
+                      <dependency>
+                        <groupId>com.example</groupId>
+                        <artifactId>widget</artifactId>
+                        <version>1.0.0</version>
+                      </dependency>
+                    </dependencies>
+                  </dependencyManagement>
+                </project>
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo_b.join("bomb-1.0.0.pom"),
+            r#"
+                <project>
+                  <groupId>com.example</groupId>
+                  <artifactId>bomb</artifactId>
+                  <version>1.0.0</version>
+                  <dependencyManagement>
+                    <dependencies>
+                      <dependency>
+                        <groupId>com.example</groupId>
+                        <artifactId>widget</artifactId>
+                        <version>2.0.0</version>
+                      </dependency>
+                    </dependencies>
+                  </dependencyManagement>
+                </project>
+            "#,
+        )
+        .unwrap();
+
+        let repo_url = format!("file://{}", dir.join("repo").display());
+        let client = reqwest::blocking::Client::new();
+        let xml = r#"
+            <project>
+              <groupId>com.example</groupId>
+              <artifactId>demo</artifactId>
+              <version>1.0.0</version>
+              <dependencyManagement>
+                <dependencies>
+                  <dependency>
+                    <groupId>com.example</groupId>
+                    <artifactId>boma</artifactId>
+                    <version>1.0.0</version>
+                    <type>pom</type>
+                    <scope>import</scope>
+                  </dependency>
+                  <dependency>
+                    <groupId>com.example</groupId>
+                    <artifactId>bomb</artifactId>
+                    <version>1.0.0</version>
+                    <type>pom</type>
+                    <scope>import</scope>
+                  </dependency>
+                </dependencies>
+              </dependencyManagement>
+              <dependencies>
+                <dependency>
+                  <groupId>com.example</groupId>
+                  <artifactId>widget</artifactId>
+                </dependency>
+              </dependencies>
+            </project>
+        "#;
+        let pom = parse_pom(xml).unwrap();
+        let (properties, managed) = maven_context(&pom);
+        let managed = merge_bom_imports(&client, &[repo_url], &pom, &properties, managed).unwrap();
+        assert_eq!(
+            managed
+                .get(&("com.example".into(), "widget".into()))
+                .map(String::as_str),
+            Some("2.0.0")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -38,6 +38,8 @@ pub struct PomDependency {
     pub version: Option<String>,
     /// Maven scope ("compile", "runtime", "test", ...).  Defaults to "compile".
     pub scope: String,
+    /// External dependency type; `pom` marks a BOM import.
+    pub typ: Option<String>,
     /// `optional` dependencies are excluded from the transitive resolution.
     pub optional: bool,
     /// Coordinates of excluded transitive dependencies.
@@ -217,6 +219,7 @@ fn parse_dependency(node: roxmltree::Node<'_, '_>) -> Option<PomDependency> {
         artifact_id,
         version: text_of(node, "version").map(str::to_string),
         scope: text_of(node, "scope").unwrap_or("compile").to_string(),
+        typ: text_of(node, "type").map(str::to_string),
         optional: text_of(node, "optional").is_some_and(|o| o.eq_ignore_ascii_case("true")),
         exclusions,
     })

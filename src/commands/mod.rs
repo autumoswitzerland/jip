@@ -24,8 +24,12 @@
 
 pub mod add;
 pub mod build;
+pub mod clean;
+pub mod completion;
 pub mod init;
 pub mod jar;
+pub mod list;
+pub mod outdated;
 pub mod remove;
 pub mod resolve;
 pub mod run;
@@ -130,7 +134,7 @@ pub fn ensure_jars(cache: &Cache, artifacts: &[Artifact], repos: &[String]) -> a
 /// The pinned runtime, compile-only, and test artifacts from `jip.lock`, or
 /// a freshly resolved set when the lock file is missing (writing it back so
 /// the project stays reproducible).
-fn lock_parts(
+pub fn lock_parts(
     client: &Client,
     config: &ProjectConfig,
 ) -> anyhow::Result<(Vec<Artifact>, Vec<Artifact>, Vec<Artifact>)> {

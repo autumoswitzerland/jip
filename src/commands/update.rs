@@ -13,8 +13,8 @@
 // =============================================================================
 //  jip — `jip update`
 //  ---------------------------------------------------------------------------
-//  Checks every direct dependency for a newer version on Maven Central and
-//  updates `jip.toml` and `jip.lock` accordingly.
+//  Checks every direct dependency (or a single one) for a newer version on
+//  the repositories and updates `jip.toml` and `jip.lock` accordingly.
 //
 //  Project:   jip
 //  Author:    autumo GmbH
@@ -33,15 +33,20 @@ use crate::commands::{
 };
 use crate::config::CONFIG_FILE;
 
-/// Update all direct dependencies to their latest versions.
-pub fn run(client: &reqwest::blocking::Client) -> anyhow::Result<()> {
+/// Update all direct dependencies — or a single one — to their latest
+/// versions.
+pub fn run(client: &reqwest::blocking::Client, dependency: Option<&str>) -> anyhow::Result<()> {
     let mut config = require_config()?;
     let repos = repositories_for(&config);
 
     let mut changed = 0;
-    changed += update_versions(client, &repos, &mut config.dependencies)?;
-    changed += update_versions(client, &repos, &mut config.provided_dependencies)?;
-    changed += update_versions(client, &repos, &mut config.test_dependencies)?;
+    if let Some(key) = dependency {
+        changed = update_one(client, &repos, key, &mut config)?;
+    } else {
+        changed += update_versions(client, &repos, &mut config.dependencies)?;
+        changed += update_versions(client, &repos, &mut config.provided_dependencies)?;
+        changed += update_versions(client, &repos, &mut config.test_dependencies)?;
+    }
 
     if changed == 0 {
         println!(
@@ -83,6 +88,69 @@ pub fn run(client: &reqwest::blocking::Client) -> anyhow::Result<()> {
         ))
     );
     Ok(())
+}
+
+/// Update a single dependency across the runtime, compile-only and test
+/// sections, returning how many entries changed.
+fn update_one(
+    client: &reqwest::blocking::Client,
+    repos: &[String],
+    key: &str,
+    config: &mut crate::config::ProjectConfig,
+) -> anyhow::Result<usize> {
+    if let Some(version) = config.dependencies.get(key) {
+        update_dep(
+            client,
+            repos,
+            key,
+            &version.clone(),
+            &mut config.dependencies,
+        )
+    } else if let Some(version) = config.provided_dependencies.get(key) {
+        update_dep(
+            client,
+            repos,
+            key,
+            &version.clone(),
+            &mut config.provided_dependencies,
+        )
+    } else if let Some(version) = config.test_dependencies.get(key) {
+        update_dep(
+            client,
+            repos,
+            key,
+            &version.clone(),
+            &mut config.test_dependencies,
+        )
+    } else {
+        bail!(
+            "{key} is not a direct dependency in {CONFIG_FILE} — \
+             use the key from `jip list`"
+        );
+    }
+}
+
+/// Look up the newest version for one dependency key and note the bump.
+fn update_dep(
+    client: &reqwest::blocking::Client,
+    repos: &[String],
+    key: &str,
+    version: &str,
+    deps: &mut BTreeMap<String, String>,
+) -> anyhow::Result<usize> {
+    let Some((group, artifact)) = key.split_once(':') else {
+        bail!("expected \"group:artifact\", got \"{key}\"");
+    };
+    let Some(latest) = central::latest_version(client, repos, group, artifact)? else {
+        bail!("no newer version found for {key} — is it on a configured repository?");
+    };
+    if latest == *version {
+        println!("{key}: already at {version}");
+        return Ok(0);
+    }
+    println!("{key}: {version} -> {latest}");
+    deps.insert(key.to_string(), latest);
+    Ok(1)
 }
 
 /// Update one dependency map to the latest versions on the repositories,

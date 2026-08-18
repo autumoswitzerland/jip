@@ -127,5 +127,36 @@ pub enum Command {
     Tree,
 
     /// Update direct dependencies to their latest versions and re-resolve.
-    Update,
+    ///
+    /// Without an argument every direct dependency in `jip.toml` is checked
+    /// and updated.  With a `group:artifact` key only that dependency is
+    /// updated.
+    Update {
+        /// Dependency key `group:artifact` to update (default: all).
+        dependency: Option<String>,
+    },
+
+    /// Show which dependencies have newer versions available (read-only).
+    ///
+    /// Prints `group:artifact: installed -> latest` for every direct
+    /// dependency, without touching `jip.toml` or `jip.lock`.
+    Outdated,
+
+    /// List all resolved dependencies with their versions.
+    ///
+    /// Prints the runtime, compile-only (`provided`) and test dependencies
+    /// from `jip.lock`, resolving first when the lock file is missing.
+    List,
+
+    /// Remove `target/` build artifacts.
+    Clean,
+
+    /// Print shell completions for bash, zsh, or fish.
+    ///
+    /// Direct the output to the shell's completion file, e.g.
+    /// `jip completion zsh >> ~/.zshrc`.
+    Completion {
+        /// The shell to generate completions for: `bash`, `zsh` or `fish`.
+        shell: String,
+    },
 }
