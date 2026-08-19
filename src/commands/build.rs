@@ -73,9 +73,70 @@ pub fn run(client: &reqwest::blocking::Client, offline: bool) -> anyhow::Result<
         ConversionOffer::Declined => return Ok(()),
         ConversionOffer::Proceed => Box::new(load_config()?),
     };
+
+    // Multi-module build: compile each module in topological order.
+    if crate::multi::is_multi_module(&config) {
+        return run_multi_module(client, &config, offline);
+    }
+
     let classpath = compile_classpath_for(client, &config, offline)?;
     check_java_version(config.project.java.as_deref())?;
     compile(&config, &classpath)
+}
+
+/// Build all modules in topological order.
+fn run_multi_module(
+    client: &reqwest::blocking::Client,
+    root_config: &ProjectConfig,
+    offline: bool,
+) -> anyhow::Result<()> {
+    let layout = crate::multi::detect_multi_module()
+        .context("multi-module config found but cannot detect module layout")?;
+
+    let sorted = crate::multi::topological_sort(&layout.modules)?;
+    let root_dir = std::env::current_dir()?;
+
+    check_java_version(root_config.project.java.as_deref())?;
+
+    println!(
+        "{}",
+        crate::console::green(&format!(
+            "building {} modules in order: {}",
+            sorted.len(),
+            sorted
+                .iter()
+                .map(|m| m.name.as_str())
+                .collect::<Vec<_>>()
+                .join(" -> ")
+        ))
+    );
+
+    for module in &sorted {
+        let module_config = crate::multi::load_module_config(&root_dir, &module.path)?;
+
+        // cd into the module directory so lock/cache resolution finds the
+        // per-module jip.lock and jip.toml (they use CWD-relative paths).
+        let original_dir = std::env::current_dir()?;
+        std::env::set_current_dir(root_dir.join(&module.path))?;
+
+        // Build the classpath: external deps + inter-module target/classes.
+        let external_classpath = compile_classpath_for(client, &module_config, offline)?;
+        let full_classpath =
+            crate::multi::module_classpath(&root_dir, &layout, module, &external_classpath);
+
+        println!(
+            "{}",
+            crate::console::green(&format!("building module '{}'...", module.name))
+        );
+
+        let result = compile(&module_config, &full_classpath);
+
+        std::env::set_current_dir(&original_dir)?;
+
+        result?;
+    }
+
+    Ok(())
 }
 
 /// Compile the project's sources into `target/classes`, skipping the work

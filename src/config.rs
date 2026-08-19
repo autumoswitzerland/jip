@@ -94,6 +94,18 @@ pub struct ProjectConfig {
     /// the runtime classpath (`jip run`/`jip build`).
     #[serde(default, rename = "test-dependencies")]
     pub test_dependencies: BTreeMap<String, String>,
+    /// Multi-module project layout.  When present, `jip build` compiles
+    /// every module in topological order and `jip run` flattens all
+    /// `target/classes` directories into a single classpath.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modules: Option<MultiModuleConfig>,
+}
+
+/// Multi-module project configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultiModuleConfig {
+    /// Module names and their relative directory paths.
+    pub modules: BTreeMap<String, String>,
 }
 
 /// Project-level settings.
@@ -199,6 +211,7 @@ impl ProjectConfig {
             dependencies: BTreeMap::new(),
             provided_dependencies: BTreeMap::new(),
             test_dependencies: BTreeMap::new(),
+            modules: None,
         }
     }
 }

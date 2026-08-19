@@ -60,7 +60,10 @@ pub fn run(client: &reqwest::blocking::Client, dependency: &str) -> anyhow::Resu
                 if let Some(desc) = text_of(root, "description") {
                     let desc = desc.trim();
                     if !desc.is_empty() {
-                        println!("describe: {desc}");
+                        println!("description:");
+                        for line in desc.lines() {
+                            println!("  {}", line.trim());
+                        }
                     }
                 }
 

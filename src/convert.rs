@@ -32,7 +32,7 @@
 //  Date:      2026-08-16
 // =============================================================================
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{IsTerminal, Write};
 use std::path::Path;
@@ -45,7 +45,9 @@ use crate::cache::download_repo_text;
 use crate::central;
 use crate::commands::build::{self, MainDecision, MainTarget};
 use crate::commands::{resolve, resolve_provided, resolve_tests, write_lock};
-use crate::config::{CONFIG_FILE, CacheSettings, ProjectConfig, ProjectSettings};
+use crate::config::{
+    CONFIG_FILE, CacheSettings, MultiModuleConfig, ProjectConfig, ProjectSettings,
+};
 use crate::lock::LOCK_FILE;
 use crate::pom::{Pom, PomDependency, is_runtime_dependency, parse_pom};
 use crate::resolver::{DEFAULT_REPO_URL, interpolate};
@@ -886,6 +888,157 @@ pub fn gradle_repositories_from_content(content: &str) -> BTreeMap<String, Strin
     repos
 }
 
+/// Extract dependencies declared in `subprojects { dependencies { ... } }` and
+/// `allprojects { dependencies { ... } }` blocks from a root `build.gradle`.
+///
+/// Returns `(runtime, test, provided, repositories)` — the inherited deps and
+/// repos that should be merged into every child module.
+#[allow(clippy::type_complexity)]
+pub fn gradle_subprojects_deps(
+    content: &str,
+) -> (
+    Vec<ConvertedDependency>,
+    Vec<ConvertedDependency>,
+    Vec<ConvertedDependency>,
+    BTreeMap<String, String>,
+) {
+    // Regexes for dependency lines (same patterns as gradle_dependencies_from_content).
+    let configurations = RUNTIME_CONFIGURATIONS
+        .iter()
+        .chain(&TEST_CONFIGURATIONS)
+        .copied()
+        .collect::<Vec<_>>()
+        .join("|");
+    let shorthand = Regex::new(&format!(
+        r#"^\s*({configurations})\s*(\(\s*)?['"]([^:'"]+):([^:'"]+):([^'"]+)['"]"#
+    ))
+    .unwrap();
+    let groovy_named = Regex::new(
+        r#"^\s*(implementation|api|runtimeOnly|compile)\s*(\(\s*)?group:\s*['"]([^'"]+)['"],\s*name:\s*['"]([^'"]+)['"],\s*version:\s*['"]([^'"]+)['"]"#,
+    ).unwrap();
+    let kotlin_named = Regex::new(
+        r#"^\s*(implementation|api|runtimeOnly|compile)\s*\(\s*group\s*=\s*"([^"]+)",\s*name\s*=\s*"([^"]+)",\s*version\s*=\s*"([^"]+)""#,
+    ).unwrap();
+    let compile_only_configs = COMPILE_ONLY_CONFIGURATIONS.join("|");
+    let compile_shorthand = Regex::new(&format!(
+        r#"^\s*({compile_only_configs})\s*(\(\s*)?['"]([^:'"]+):([^:'"]+):([^'"]+)['"]"#
+    ))
+    .unwrap();
+    let re_url_uri = Regex::new(r#"url\s*=\s*uri\(["']([^"']+)["']\)"#).unwrap();
+    let re_url_eq = Regex::new(r#"url\s*=\s*["']([^"']+)["']"#).unwrap();
+    let re_url_space = Regex::new(r#"url\s+["']([^"']+)["']"#).unwrap();
+    let re_maven_inline = Regex::new(r#"maven\(["']([^"']+)["']\)"#).unwrap();
+
+    let basedir = std::env::current_dir()
+        .ok()
+        .map(|dir| dir.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let resolve_url = |url: &str| -> String {
+        let url = url.replace("$projectDir", &basedir);
+        url.replace("${projectDir}", &basedir)
+    };
+
+    let mut runtime = Vec::new();
+    let mut test = Vec::new();
+    let mut provided = Vec::new();
+    let mut repos = BTreeMap::new();
+
+    let mut depth = 0i32;
+    let mut in_block = 0i32; // inside subprojects/allprojects
+    let mut in_deps = 0i32; // inside dependencies { } inside that block
+    let mut in_repos = 0i32; // inside repositories { } inside that block
+    let mut in_maven = 0i32; // inside maven { } inside repositories
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("//") || trimmed.starts_with("/*") {
+            continue;
+        }
+
+        let open = trimmed.chars().filter(|&c| c == '{').count();
+        let close = trimmed.chars().filter(|&c| c == '}').count();
+
+        // Enter subprojects/allprojects block
+        if in_block == 0 && open > 0 {
+            let dominated = trimmed.contains("subprojects") || trimmed.contains("allprojects");
+            if dominated {
+                in_block = depth + 1;
+            }
+        }
+        // Enter dependencies block inside subprojects/allprojects
+        if in_block > 0 && in_deps == 0 && open > 0 && trimmed.contains("dependencies") {
+            in_deps = depth + 1;
+        }
+        // Enter repositories block inside subprojects/allprojects
+        if in_block > 0 && in_repos == 0 && open > 0 && trimmed.contains("repositories") {
+            in_repos = depth + 1;
+        }
+        // Enter maven block inside repositories
+        if in_repos > 0 && in_maven == 0 && open > 0 && trimmed.contains("maven") {
+            in_maven = depth + 1;
+        }
+
+        depth += open as i32;
+
+        // Parse dependency lines when inside dependencies block
+        if in_deps > 0 {
+            if let Some((dep, is_test)) = match_shorthand(trimmed, &shorthand) {
+                if is_test {
+                    test.push(dep);
+                } else {
+                    runtime.push(dep);
+                }
+            } else if let Some(dep) = match_named(trimmed, &groovy_named, &kotlin_named) {
+                runtime.push(dep);
+            } else if let Some(caps) = compile_shorthand.captures(trimmed)
+                && let (Some(group), Some(artifact), Some(version)) =
+                    (caps.get(3), caps.get(4), caps.get(5))
+            {
+                provided.push(convert(group.as_str(), artifact.as_str(), version.as_str()));
+            }
+        }
+
+        // Parse repository URLs inside repositories block
+        if in_maven > 0 {
+            if let Some(caps) = re_url_uri.captures(trimmed) {
+                let url = resolve_url(caps.get(1).unwrap().as_str());
+                repos.insert(url.clone(), url);
+            } else if let Some(caps) = re_url_eq.captures(trimmed) {
+                let url = resolve_url(caps.get(1).unwrap().as_str());
+                repos.insert(url.clone(), url);
+            } else if let Some(caps) = re_url_space.captures(trimmed) {
+                let url = resolve_url(caps.get(1).unwrap().as_str());
+                repos.insert(url.clone(), url);
+            }
+        }
+        if in_repos > 0
+            && in_maven == 0
+            && let Some(caps) = re_maven_inline.captures(trimmed)
+        {
+            let url = resolve_url(caps.get(1).unwrap().as_str());
+            repos.insert(url.clone(), url);
+        }
+
+        depth -= close as i32;
+
+        // Exit blocks
+        if in_maven > 0 && depth < in_maven {
+            in_maven = 0;
+        }
+        if in_repos > 0 && depth < in_repos {
+            in_repos = 0;
+        }
+        if in_deps > 0 && depth < in_deps {
+            in_deps = 0;
+        }
+        if in_block > 0 && depth < in_block {
+            in_block = 0;
+        }
+    }
+
+    (runtime, test, provided, repos)
+}
+
 /// Match a single-line `group:artifact:version` declaration, reporting
 /// whether the configuration is a test one.
 fn match_shorthand(line: &str, re: &Regex) -> Option<(ConvertedDependency, bool)> {
@@ -983,6 +1136,16 @@ pub fn offer_conversion(client: &reqwest::blocking::Client) -> anyhow::Result<Co
 /// Build a fresh `jip.toml` (and lock file) for the current directory,
 /// converting the detected Maven/Gradle dependencies when present.
 pub fn convert_project(client: &reqwest::blocking::Client) -> anyhow::Result<ProjectConfig> {
+    // Check for multi-module project first.
+    if let Some(layout) = crate::multi::detect_multi_module() {
+        return convert_multi_module(client, &layout);
+    }
+
+    convert_single_module(client)
+}
+
+/// Convert a single-module project (the original path).
+fn convert_single_module(client: &reqwest::blocking::Client) -> anyhow::Result<ProjectConfig> {
     let project_type = detect();
     let mut config = ProjectConfig {
         project: ProjectSettings {
@@ -998,6 +1161,7 @@ pub fn convert_project(client: &reqwest::blocking::Client) -> anyhow::Result<Pro
         dependencies: BTreeMap::new(),
         provided_dependencies: BTreeMap::new(),
         test_dependencies: BTreeMap::new(),
+        modules: None,
     };
 
     if let Some(project_type) = project_type {
@@ -1051,6 +1215,249 @@ pub fn convert_project(client: &reqwest::blocking::Client) -> anyhow::Result<Pro
     let tests = resolve_tests(client, &config, false)?;
     write_lock(&resolution.flat, &provided.flat, &tests.flat)?;
     Ok(config)
+}
+
+/// Convert a multi-module project: create a root `jip.toml` and per-module
+/// configs, skipping inter-module dependencies from external resolution.
+fn convert_multi_module(
+    client: &reqwest::blocking::Client,
+    layout: &crate::multi::MultiModuleLayout,
+) -> anyhow::Result<ProjectConfig> {
+    let project_type = detect().unwrap_or(match layout.build_system {
+        crate::multi::BuildSystem::Maven => ProjectType::Maven,
+        crate::multi::BuildSystem::GradleGroovy => ProjectType::GradleGroovy,
+        crate::multi::BuildSystem::GradleKotlin => ProjectType::GradleKotlin,
+    });
+    let root_dir = std::env::current_dir().context("cannot determine working directory")?;
+
+    // Build the module map for the root config.
+    let module_map: BTreeMap<String, String> = layout
+        .modules
+        .iter()
+        .map(|m| (m.name.clone(), m.path.clone()))
+        .collect();
+
+    // Build a set of all sibling artifact IDs for filtering.
+    // Any dependency whose artifact ID matches a sibling module's artifact ID
+    // should be resolved at build time from compiled classes, not externally.
+    let inter_module_aids: HashSet<String> = layout
+        .modules
+        .iter()
+        .filter_map(|m| m.artifact_id.clone())
+        .collect();
+
+    // Collect shared repositories from the parent POM or root build file.
+    let mut shared_repositories = BTreeMap::new();
+
+    // For Gradle multi-module projects, parse subprojects/allprojects deps
+    // from the root build.gradle so child modules inherit them.
+    let mut inherited_runtime = Vec::new();
+    let mut inherited_test = Vec::new();
+    let mut inherited_provided = Vec::new();
+
+    if let Some(project_type_enum) = match layout.build_system {
+        crate::multi::BuildSystem::Maven => Some(ProjectType::Maven),
+        crate::multi::BuildSystem::GradleGroovy => Some(ProjectType::GradleGroovy),
+        crate::multi::BuildSystem::GradleKotlin => Some(ProjectType::GradleKotlin),
+    } {
+        if matches!(
+            layout.build_system,
+            crate::multi::BuildSystem::GradleGroovy | crate::multi::BuildSystem::GradleKotlin
+        ) {
+            let root_build = if std::path::Path::new("build.gradle.kts").exists() {
+                fs::read_to_string("build.gradle.kts").unwrap_or_default()
+            } else {
+                fs::read_to_string("build.gradle").unwrap_or_default()
+            };
+            let (rt, tst, prv, sub_repos) = gradle_subprojects_deps(&root_build);
+            inherited_runtime = rt;
+            inherited_test = tst;
+            inherited_provided = prv;
+            shared_repositories = sub_repos;
+        } else {
+            let converted = collect_dependencies(client, project_type_enum)?;
+            shared_repositories = converted.repositories;
+        }
+    }
+
+    let java_version = java_default_for(Some(project_type));
+
+    // Convert each module independently.
+    let mut all_module_configs = Vec::new();
+    for module in &layout.modules {
+        let module_dir = root_dir.join(&module.path);
+        let module_type = if module_dir.join("pom.xml").exists() {
+            Some(ProjectType::Maven)
+        } else if module_dir.join("build.gradle.kts").exists() {
+            Some(ProjectType::GradleKotlin)
+        } else if module_dir.join("build.gradle").exists() {
+            Some(ProjectType::GradleGroovy)
+        } else {
+            None
+        };
+
+        let mut module_config = ProjectConfig {
+            project: ProjectSettings {
+                name: Some(module.name.clone()),
+                java: Some(java_version.clone()),
+                main: None,
+                source: None,
+            },
+            cache: CacheSettings::default(),
+            proxy: crate::config::ProxySettings::default(),
+            classpath: crate::config::ClasspathSettings::default(),
+            repositories: shared_repositories.clone(),
+            dependencies: BTreeMap::new(),
+            provided_dependencies: BTreeMap::new(),
+            test_dependencies: BTreeMap::new(),
+            modules: None,
+        };
+
+        if let Some(mt) = module_type {
+            // Temporarily change directory to the module to collect dependencies.
+            let original_dir = std::env::current_dir()?;
+            std::env::set_current_dir(&module_dir)?;
+
+            let converted = collect_dependencies(client, mt)?;
+            let repos = crate::commands::repositories_for(&module_config);
+
+            // Merge inherited deps: module-local wins over inherited for
+            // the same group:artifact.  Start with inherited, then override.
+            let mut merged_runtime = inherited_runtime.clone();
+            for dep in &converted.runtime {
+                merged_runtime.retain(|d| d.key() != dep.key());
+                merged_runtime.push(dep.clone());
+            }
+            let mut merged_provided = inherited_provided.clone();
+            for dep in &converted.provided {
+                merged_provided.retain(|d| d.key() != dep.key());
+                merged_provided.push(dep.clone());
+            }
+            let mut merged_test = inherited_test.clone();
+            for dep in &converted.test {
+                merged_test.retain(|d| d.key() != dep.key());
+                merged_test.push(dep.clone());
+            }
+
+            // Filter out inter-module dependencies.
+            let runtime = merged_runtime
+                .into_iter()
+                .filter(|d| !inter_module_aids.contains(&d.artifact))
+                .collect();
+            let provided = merged_provided
+                .into_iter()
+                .filter(|d| !inter_module_aids.contains(&d.artifact))
+                .collect();
+            let test = merged_test
+                .into_iter()
+                .filter(|d| !inter_module_aids.contains(&d.artifact))
+                .collect();
+
+            module_config.dependencies = convert_to_config(client, &repos, runtime)?;
+            module_config.provided_dependencies = convert_to_config(client, &repos, provided)?;
+            module_config.test_dependencies = convert_to_config(client, &repos, test)?;
+
+            // Detect main class for this module.
+            match build::resolve_main(&module_config, None) {
+                Ok(MainDecision::Run(target)) => {
+                    module_config.project.main = Some(main_value(target));
+                }
+                Ok(MainDecision::Multiple(candidates)) => {
+                    if std::io::stdin().is_terminal() {
+                        if let Ok(target) = build::choose_main(&candidates) {
+                            module_config.project.main = Some(main_value(target));
+                        }
+                    } else {
+                        println!(
+                            "  {} {}",
+                            crate::console::yellow("warning:"),
+                            build::multiple_main_error(&candidates).replace('\n', "\n  ")
+                        );
+                    }
+                }
+                _ => {}
+            }
+
+            std::env::set_current_dir(&original_dir)?;
+        }
+
+        // Write the module's jip.toml.
+        let module_toml_path = module_dir.join(CONFIG_FILE);
+        module_config.save(&module_toml_path)?;
+
+        // Resolve and write lock for the module.
+        let original_dir = std::env::current_dir()?;
+        std::env::set_current_dir(&module_dir)?;
+        let resolution = resolve(client, &module_config, false)?;
+        let provided = resolve_provided(client, &module_config, false)?;
+        let tests = resolve_tests(client, &module_config, false)?;
+        write_lock(&resolution.flat, &provided.flat, &tests.flat)?;
+        std::env::set_current_dir(&original_dir)?;
+
+        let dep_count = module_config.dependencies.len();
+        println!(
+            "{}",
+            crate::console::green(&format!(
+                "converted module '{}' — {} dependencies",
+                module.name, dep_count
+            ))
+        );
+
+        all_module_configs.push(module_config);
+    }
+
+    // Build the root config.
+    let mut root_config = ProjectConfig {
+        project: ProjectSettings {
+            name: Some(current_directory_name()),
+            java: Some(java_version),
+            main: all_module_configs
+                .iter()
+                .find_map(|c| c.project.main.clone()),
+            source: None,
+        },
+        cache: CacheSettings::default(),
+        proxy: crate::config::ProxySettings::default(),
+        classpath: crate::config::ClasspathSettings::default(),
+        repositories: shared_repositories,
+        dependencies: BTreeMap::new(),
+        provided_dependencies: BTreeMap::new(),
+        test_dependencies: BTreeMap::new(),
+        modules: Some(MultiModuleConfig {
+            modules: module_map,
+        }),
+    };
+
+    // Detect main class from the root (for multi-module, this is usually
+    // the module that has the main class).
+    match build::resolve_main(&root_config, None) {
+        Ok(MainDecision::Run(target)) => {
+            root_config.project.main = Some(main_value(target));
+        }
+        Ok(MainDecision::Multiple(candidates)) if std::io::stdin().is_terminal() => {
+            if let Ok(target) = build::choose_main(&candidates) {
+                root_config.project.main = Some(main_value(target));
+            }
+        }
+        _ => {}
+    }
+
+    root_config.save(Path::new(CONFIG_FILE))?;
+
+    println!(
+        "{}",
+        crate::console::green(&format!(
+            "converted multi-module {} project — {} modules",
+            match layout.build_system {
+                crate::multi::BuildSystem::Maven => "Maven",
+                crate::multi::BuildSystem::GradleGroovy => "Gradle (Groovy)",
+                crate::multi::BuildSystem::GradleKotlin => "Gradle (Kotlin)",
+            },
+            layout.modules.len()
+        ))
+    );
+
+    Ok(root_config)
 }
 
 /// The Java version jip writes into a fresh `jip.toml`: the project's own
@@ -1917,5 +2324,97 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gradle_subprojects_deps_parses_runtime_test_provided() {
+        let root = r#"
+            plugins {
+                id 'java'
+            }
+
+            subprojects {
+                apply plugin: 'java'
+
+                dependencies {
+                    implementation 'org.slf4j:slf4j-api:1.7.26'
+                    implementation 'com.google.guava:guava:29.0-jre'
+                    compileOnly 'org.projectlombok:lombok:1.18.12'
+                    testImplementation 'org.junit.jupiter:junit-jupiter-api:5.6.2'
+                    testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.6.2'
+                }
+
+                repositories {
+                    maven { url = uri("https://maven.example.com/releases") }
+                }
+            }
+        "#;
+
+        let (runtime, test, provided, repos) = gradle_subprojects_deps(root);
+
+        assert_eq!(runtime.len(), 2);
+        assert_eq!(runtime[0].artifact, "slf4j-api");
+        assert_eq!(runtime[1].artifact, "guava");
+
+        assert_eq!(provided.len(), 1);
+        assert_eq!(provided[0].artifact, "lombok");
+
+        assert_eq!(test.len(), 1);
+        assert_eq!(test[0].artifact, "junit-jupiter-api");
+
+        assert!(repos.contains_key("https://maven.example.com/releases"));
+    }
+
+    #[test]
+    fn gradle_subprojects_deps_allprojects_also_works() {
+        let root = r#"
+            allprojects {
+                dependencies {
+                    implementation 'com.google.guava:guava:30.0-jre'
+                }
+            }
+        "#;
+
+        let (runtime, test, provided, repos) = gradle_subprojects_deps(root);
+        assert_eq!(runtime.len(), 1);
+        assert_eq!(runtime[0].artifact, "guava");
+        assert!(test.is_empty());
+        assert!(provided.is_empty());
+        assert!(repos.is_empty());
+    }
+
+    #[test]
+    fn gradle_subprojects_deps_empty_when_no_subprojects() {
+        let root = r#"
+            plugins { id 'java' }
+
+            dependencies {
+                implementation 'com.google.guava:guava:30.0-jre'
+            }
+        "#;
+
+        let (runtime, test, provided, repos) = gradle_subprojects_deps(root);
+        assert!(runtime.is_empty());
+        assert!(test.is_empty());
+        assert!(provided.is_empty());
+        assert!(repos.is_empty());
+    }
+
+    #[test]
+    fn gradle_subprojects_deps_kotlin_named_style() {
+        let root = r#"
+            subprojects {
+                dependencies {
+                    implementation(group = "org.slf4j", name = "slf4j-api", version = "1.7.26")
+                    compileOnly 'org.projectlombok:lombok:1.18.12'
+                }
+            }
+        "#;
+
+        let (runtime, _test, provided, _repos) = gradle_subprojects_deps(root);
+        assert_eq!(runtime.len(), 1);
+        assert_eq!(runtime[0].artifact, "slf4j-api");
+        assert_eq!(provided.len(), 1);
+        assert_eq!(provided[0].artifact, "lombok");
     }
 }

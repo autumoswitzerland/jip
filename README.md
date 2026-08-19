@@ -8,7 +8,7 @@
   Clone a project, run it — jip handles dependencies, compilation, and execution
   in a single binary with a single slim config file.
 
-  <img src="https://img.shields.io/badge/version-1.1.0-FFD54F">
+  <img src="https://img.shields.io/badge/version-1.0.0-FFD54F">
   <img src="https://img.shields.io/badge/license-AGPLv3-orange">
   <img src="https://img.shields.io/badge/rust-2024-blue">
 
@@ -36,8 +36,13 @@
 - **M2 cache reuse** — optionally uses `~/.m2/repository` jars instead of re-downloading
 - **Dependency tree** — compact view of resolved dependencies
 - **Upkeep commands** — `jip list`, `jip outdated`, `jip update [<dep>]`, `jip clean`, and `jip completion <shell>` keep projects tidy
+- **Dependency info** — `jip info <dep>` shows latest version, description, and license
 - **BOM / platform support** — Maven `<scope>import</scope>` BOMs and Gradle `platform()` / `enforcedPlatform()` are resolved during conversion
 - **Gradle version catalogs** — `gradle/libs.versions.toml` `[libraries]` + `[versions]` are resolved automatically
+- **JDK management** — `jip java install/use/list/remove` manages JDK installations from multiple vendors
+- **Offline mode** — `--offline` flag uses only locally cached jars, no network access
+- **Multi-module projects** — Maven multi-module and Gradle multi-project builds are detected automatically; `jip init` creates a root config with `[modules]` and per-module `jip.toml` files; `jip build` compiles modules in dependency order; `jip run` flattens all module classes onto the classpath
+- **Proxy support** — HTTP/HTTPS proxy via `[proxy]` in `jip.toml` or `HTTP_PROXY`/`HTTPS_PROXY` env vars
 
 ## Quick Start
 
@@ -87,6 +92,8 @@ jip run            # runs with the converted dependencies
 | `jip outdated` | Show which dependencies have newer versions (read-only) |
 | `jip update [<dep>]` | Bump one or all dependencies to their latest versions (with confirmation) |
 | `jip clean` | Remove `target/` build artifacts |
+| `jip info <dep>` | Show metadata for a dependency (version, description, license) |
+| `jip java <cmd>` | Manage JDK installations (install, use, list, remove) |
 | `jip completion <shell>` | Print bash/zsh/fish completions |
 
 ### `jip init`
@@ -98,6 +105,13 @@ Creates a fresh `jip.toml` in the current directory. When a `pom.xml` or `build.
 - Maven `<scope>test</scope>` / Gradle `testImplementation` → `[test-dependencies]`
 - Maven `<repositories>` / Gradle `maven { url = ... }` → `[repositories]`
 - Java version from `maven-compiler-plugin` or Gradle `toolchain` / `sourceCompatibility`
+
+For **multi-module projects**, `jip init` detects the module structure (parent `<modules>` in Maven, `include` in Gradle `settings.gradle`) and creates:
+
+- A **root `jip.toml`** with a `[modules]` section listing each module and its path
+- A **per-module `jip.toml`** in each module directory with its own dependencies
+
+Modules are built in dependency order (`jip build`) and their classes are flattened onto the classpath at runtime (`jip run`). Inter-module dependencies (e.g. `project(':base')` in Gradle or sibling artifacts in Maven) are resolved from compiled classes, not external repositories.
 
 Original build files are never modified.
 
@@ -206,7 +220,8 @@ Output:
 group:    com.google.guava
 artifact: guava
 version:  33.7.1-jre
-describe: Guava is a suite of core and expanded libraries ...
+description:
+  Guava is a suite of core and expanded libraries ...
 name:     Guava: Google Core Libraries for Java
 url:      https://github.com/google/guava
 license:  Apache License, Version 2.0
@@ -297,6 +312,17 @@ Dependency keys use `group:artifact` format. Values are version strings.
 
 `jip.lock` pins all three dependency scopes and is committed to version control for reproducible builds.
 
+### `[modules]`
+
+Multi-module project configuration. Present only in the root `jip.toml` of multi-module projects. Each entry maps a module name to its relative path:
+
+```toml
+[modules]
+modules = { core = "core", webserver = "webserver", app = "app" }
+```
+
+Each module has its own `jip.toml` with dependencies specific to that module. Inter-module dependencies are resolved at build time from compiled classes, not external repositories.
+
 ### `[classpath] extra`
 
 Directories or JAR files added to the runtime/test classpath, relative to the project root. Useful for local libraries not on any repository:
@@ -359,6 +385,14 @@ Every dependency lives in one of three scopes. The table shows where each scope 
 
 Optional and system-scoped dependencies are skipped. Original `pom.xml` / `build.gradle` files are never modified.
 
+### Multi-module conversion
+
+When `jip init` detects a multi-module project (Maven parent POM with `<modules>` or Gradle `settings.gradle` with `include`), it creates a root `jip.toml` with a `[modules]` section and converts each module independently into its own `jip.toml`.
+
+- **Maven:** inter-module dependencies (same groupId + sibling artifactId) are detected and excluded from external resolution
+- **Gradle:** `project(':...')` references are detected and excluded; inter-module deps are resolved at build time from compiled classes
+- **Gradle `subprojects {}`/`allprojects {}`:** dependencies and repositories declared in the root `build.gradle`'s `subprojects {}` or `allprojects {}` blocks are propagated to all child modules. Module-local declarations override inherited versions for the same `group:artifact`.
+
 ### BOM / platform resolution
 
 When a Maven POM imports a BOM (`<dependencyManagement>` with `<type>pom</type><scope>import</scope>`), or a Gradle build script declares `platform(...)` / `enforcedPlatform(...)`, jip downloads the BOM POM and applies its managed versions to version-less dependencies.
@@ -416,16 +450,12 @@ target/app.jar    thin jar (jip jar)
 target/app-fat.jar    fat/uber jar (jip jar --fat)
 ```
 
+For multi-module projects, the root directory contains the root `jip.toml` with `[modules]`, and each module subdirectory has its own `jip.toml`, `jip.lock`, and `target/classes/`.
+
 - **Resolution:** walks transitive dependencies from Maven Central (or custom repos), applies conflict resolution, writes `jip.lock`
 - **Compilation:** `javac` with the resolved classpath, skip-when-up-to-date based on file timestamps
 - **Execution:** `java --class-path ... MainClass` — jip builds the full classpath, the user never touches `-cp`
 - **No daemon, no background process** — every command runs and exits
-
-## Not supported
-
-jip deliberately does **not** support:
-
-- **Multi-module projects** — jip is a single-module build tool; parent/child module structures are out of scope at the moment
 
 ## License
 

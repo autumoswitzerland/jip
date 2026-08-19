@@ -32,6 +32,7 @@ mod console;
 mod convert;
 mod jdk;
 mod lock;
+mod multi;
 mod pom;
 mod resolver;
 
