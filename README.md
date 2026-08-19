@@ -191,6 +191,27 @@ test-dependencies:
   org.junit.platform:junit-platform-console-standalone = 1.13.0-M3
 ```
 
+### `jip info`
+
+Show metadata for a dependency — latest version, description, name, URL, and license. The version is optional; when omitted the latest stable version is looked up:
+
+```bash
+jip info com.google.guava:guava
+jip info org.slf4j:slf4j-api:2.0.13
+```
+
+Output:
+
+```
+group:    com.google.guava
+artifact: guava
+version:  33.7.1-jre
+describe: Guava is a suite of core and expanded libraries ...
+name:     Guava: Google Core Libraries for Java
+url:      https://github.com/google/guava
+license:  Apache License, Version 2.0
+```
+
 ### `jip clean`
 
 Removes the `target/` directory with all build artifacts (classes, tests, jars). Sources, `jip.toml` and `jip.lock` are left alone.

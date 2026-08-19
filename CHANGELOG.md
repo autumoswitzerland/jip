@@ -52,6 +52,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Proxy support: HTTP/HTTPS proxy via `[proxy]` section in `jip.toml`
   (`http-proxy`, `https-proxy`) or `HTTP_PROXY` / `HTTPS_PROXY` env vars.
   `NO_PROXY` env var is respected by reqwest automatically.
+- `jip info <dep>` — show metadata for a dependency: latest version,
+  description, name, URL, and license (from the POM).
 
 ### Changed
 

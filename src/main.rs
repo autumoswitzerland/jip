@@ -82,6 +82,7 @@ fn run(offline: bool, command: Command) -> anyhow::Result<()> {
             commands::update::run(&client, offline, dependency.as_deref())
         }
         Command::Outdated => commands::outdated::run(&client),
+        Command::Info { dependency } => commands::info::run(&client, &dependency),
         Command::List => commands::list::run(&client, offline),
         Command::Clean => commands::clean::run(),
         Command::Completion { shell } => commands::completion::run(&shell),

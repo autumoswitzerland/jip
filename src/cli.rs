@@ -152,6 +152,16 @@ pub enum Command {
     /// from `jip.lock`, resolving first when the lock file is missing.
     List,
 
+    /// Show metadata for a dependency: latest version, description, license.
+    ///
+    /// The argument is `group:artifact` (version is optional; when omitted,
+    /// the latest stable version is looked up).
+    Info {
+        /// Dependency coordinates, e.g. `com.google.guava:guava` or
+        /// `com.google.guava:guava:33.0.0-jre`.
+        dependency: String,
+    },
+
     /// Remove `target/` build artifacts.
     Clean,
 

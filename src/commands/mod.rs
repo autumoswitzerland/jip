@@ -26,6 +26,7 @@ pub mod add;
 pub mod build;
 pub mod clean;
 pub mod completion;
+pub mod info;
 pub mod init;
 pub mod jar;
 pub mod java;
