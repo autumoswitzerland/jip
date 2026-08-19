@@ -35,7 +35,11 @@ use crate::config::CONFIG_FILE;
 
 /// Update all direct dependencies — or a single one — to their latest
 /// versions.
-pub fn run(client: &reqwest::blocking::Client, dependency: Option<&str>) -> anyhow::Result<()> {
+pub fn run(
+    client: &reqwest::blocking::Client,
+    offline: bool,
+    dependency: Option<&str>,
+) -> anyhow::Result<()> {
     let mut config = require_config()?;
     let repos = repositories_for(&config);
 
@@ -76,9 +80,9 @@ pub fn run(client: &reqwest::blocking::Client, dependency: Option<&str>) -> anyh
         return Ok(());
     }
 
-    let resolution = resolve(client, &config)?;
-    let provided = resolve_provided(client, &config)?;
-    let tests = resolve_tests(client, &config)?;
+    let resolution = resolve(client, &config, offline)?;
+    let provided = resolve_provided(client, &config, offline)?;
+    let tests = resolve_tests(client, &config, offline)?;
     write_lock(&resolution.flat, &provided.flat, &tests.flat)?;
     config.save(Path::new(CONFIG_FILE))?;
     println!(

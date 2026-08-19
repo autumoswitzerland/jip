@@ -24,10 +24,10 @@ use crate::commands::{load_config, resolve, resolve_tests};
 use crate::resolver::DependencyNode;
 
 /// Resolve and print the dependency tree.
-pub fn run(client: &reqwest::blocking::Client) -> anyhow::Result<()> {
+pub fn run(client: &reqwest::blocking::Client, offline: bool) -> anyhow::Result<()> {
     let config = load_config()?;
-    let resolution = resolve(client, &config)?;
-    let tests = resolve_tests(client, &config)?;
+    let resolution = resolve(client, &config, offline)?;
+    let tests = resolve_tests(client, &config, offline)?;
 
     if resolution.tree.is_empty() && tests.tree.is_empty() {
         println!("no dependencies");

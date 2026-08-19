@@ -31,7 +31,7 @@ use crate::convert;
 use crate::lock::LOCK_FILE;
 
 /// Create a new project file, converting an existing build system if present.
-pub fn run(client: &reqwest::blocking::Client) -> anyhow::Result<()> {
+pub fn run(client: &reqwest::blocking::Client, _offline: bool) -> anyhow::Result<()> {
     let path = Path::new(CONFIG_FILE);
     if path.exists() {
         bail!("{CONFIG_FILE} already exists in this directory");

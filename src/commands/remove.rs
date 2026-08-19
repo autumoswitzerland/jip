@@ -30,6 +30,7 @@ use crate::config::CONFIG_FILE;
 /// Remove a dependency and re-resolve.
 pub fn run(
     client: &reqwest::blocking::Client,
+    offline: bool,
     dependency: &str,
     test: bool,
     provided: bool,
@@ -53,9 +54,9 @@ pub fn run(
         bail!("{dependency} is not in [{section}] in {CONFIG_FILE}");
     }
 
-    let resolution = resolve(client, &config)?;
-    let provided = resolve_provided(client, &config)?;
-    let tests = resolve_tests(client, &config)?;
+    let resolution = resolve(client, &config, offline)?;
+    let provided = resolve_provided(client, &config, offline)?;
+    let tests = resolve_tests(client, &config, offline)?;
     write_lock(&resolution.flat, &provided.flat, &tests.flat)?;
     config.save(Path::new(CONFIG_FILE))?;
 

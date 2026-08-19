@@ -29,15 +29,15 @@ use crate::commands::{
 use crate::lock::LOCK_FILE;
 
 /// Resolve, download, and write the lock file.
-pub fn run(client: &reqwest::blocking::Client) -> anyhow::Result<()> {
+pub fn run(client: &reqwest::blocking::Client, offline: bool) -> anyhow::Result<()> {
     let config = load_config()?;
-    let resolution = resolve(client, &config)?;
-    let provided = resolve_provided(client, &config)?;
-    let tests = resolve_tests(client, &config)?;
+    let resolution = resolve(client, &config, offline)?;
+    let provided = resolve_provided(client, &config, offline)?;
+    let tests = resolve_tests(client, &config, offline)?;
     write_lock(&resolution.flat, &provided.flat, &tests.flat)?;
 
     let repos = repositories_for(&config);
-    let cache = cache_for(client, &config);
+    let cache = cache_for(client, &config, offline);
     ensure_jars(&cache, &resolution.flat, &repos)?;
     ensure_jars(&cache, &provided.flat, &repos)?;
     ensure_jars(&cache, &tests.flat, &repos)?;

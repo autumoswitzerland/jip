@@ -47,20 +47,20 @@ const JAR_PATH: &str = "target/app.jar";
 const FAT_JAR_PATH: &str = "target/app-fat.jar";
 
 /// The `jip jar` command.
-pub fn run(client: &reqwest::blocking::Client, fat: bool) -> anyhow::Result<()> {
+pub fn run(client: &reqwest::blocking::Client, offline: bool, fat: bool) -> anyhow::Result<()> {
     let mut config = match convert::offer_conversion(client)? {
         ConversionOffer::Converted(config) => config,
         ConversionOffer::Declined => return Ok(()),
         ConversionOffer::Proceed => Box::new(load_config()?),
     };
 
-    let compile_classpath = compile_classpath_for(client, &config)?;
+    let compile_classpath = compile_classpath_for(client, &config, offline)?;
     build::compile(&config, &compile_classpath)?;
 
     let main_class = resolve_main_class(&config)?;
 
     if fat {
-        build_fat_jar(client, &config, &main_class)?;
+        build_fat_jar(client, &config, &main_class, offline)?;
     } else {
         build_thin_jar(&config, &main_class)?;
         offer_classpath_extra(&mut config)?;
@@ -134,6 +134,7 @@ fn build_fat_jar(
     client: &reqwest::blocking::Client,
     config: &ProjectConfig,
     main_class: &Option<String>,
+    offline: bool,
 ) -> anyhow::Result<()> {
     let classes_dir = Path::new(build::CLASSES_DIR);
     if !classes_dir.is_dir() {
@@ -143,7 +144,7 @@ fn build_fat_jar(
         );
     }
 
-    let classpath = classpath_for(client, config)?;
+    let classpath = classpath_for(client, config, offline)?;
     let fat_path = Path::new(FAT_JAR_PATH);
     fs::create_dir_all(fat_path.parent().unwrap())
         .with_context(|| format!("cannot create {}", fat_path.parent().unwrap().display()))?;

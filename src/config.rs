@@ -67,6 +67,9 @@ pub struct ProjectConfig {
     pub project: ProjectSettings,
     #[serde(default)]
     pub cache: CacheSettings,
+    /// Proxy configuration for HTTP/HTTPS connections.
+    #[serde(default, skip_serializing_if = "ProxySettings::is_default")]
+    pub proxy: ProxySettings,
     /// Extra classpath entries beyond the resolved dependency jars.
     #[serde(default, skip_serializing_if = "ClasspathSettings::is_empty")]
     pub classpath: ClasspathSettings,
@@ -118,6 +121,27 @@ pub struct CacheSettings {
     pub use_m2: bool,
 }
 
+/// Proxy settings for HTTP/HTTPS connections.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProxySettings {
+    /// HTTP proxy URL (e.g. `http://proxy:8080`).  Also read from `HTTP_PROXY`
+    /// env var when not set here.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "http-proxy"
+    )]
+    pub http_proxy: Option<String>,
+    /// HTTPS proxy URL (e.g. `http://proxy:8080`).  Also read from
+    /// `HTTPS_PROXY` env var when not set here.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "https-proxy"
+    )]
+    pub https_proxy: Option<String>,
+}
+
 /// Extra classpath entries, for resources or jars that are not on any
 /// repository.  Paths are relative to the project root.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -134,6 +158,12 @@ pub struct ClasspathSettings {
 impl ClasspathSettings {
     fn is_empty(&self) -> bool {
         self.extra.is_empty() && self.test_extra.is_empty()
+    }
+}
+
+impl ProxySettings {
+    fn is_default(&self) -> bool {
+        self.http_proxy.is_none() && self.https_proxy.is_none()
     }
 }
 
@@ -163,6 +193,7 @@ impl ProjectConfig {
         Self {
             project: ProjectSettings::default(),
             cache: CacheSettings::default(),
+            proxy: ProxySettings::default(),
             classpath: ClasspathSettings::default(),
             repositories: BTreeMap::new(),
             dependencies: BTreeMap::new(),
@@ -227,5 +258,36 @@ mod tests {
         let config = ProjectConfig::default_config();
         let saved = toml::to_string_pretty(&config).unwrap();
         assert!(!saved.contains("provided-dependencies"));
+    }
+
+    #[test]
+    fn proxy_settings_round_trip() {
+        let raw = r#"
+            [project]
+            name = "demo"
+
+            [proxy]
+            http-proxy = "http://proxy:8080"
+            https-proxy = "http://proxy:8443"
+        "#;
+        let config: ProjectConfig = toml::from_str(raw).unwrap();
+        assert_eq!(
+            config.proxy.http_proxy.as_deref(),
+            Some("http://proxy:8080")
+        );
+        assert_eq!(
+            config.proxy.https_proxy.as_deref(),
+            Some("http://proxy:8443")
+        );
+        let saved = toml::to_string_pretty(&config).unwrap();
+        assert!(saved.contains("http-proxy"));
+        assert!(saved.contains("https-proxy"));
+    }
+
+    #[test]
+    fn empty_proxy_section_is_omitted() {
+        let config = ProjectConfig::default_config();
+        let saved = toml::to_string_pretty(&config).unwrap();
+        assert!(!saved.contains("[proxy]"));
     }
 }

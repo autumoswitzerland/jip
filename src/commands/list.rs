@@ -26,9 +26,9 @@ use crate::artifact::Artifact;
 use crate::commands::{lock_parts, require_config};
 
 /// List all resolved dependencies, grouped by their scope.
-pub fn run(client: &reqwest::blocking::Client) -> anyhow::Result<()> {
+pub fn run(client: &reqwest::blocking::Client, offline: bool) -> anyhow::Result<()> {
     let config = require_config()?;
-    let (runtime, provided, test) = lock_parts(client, &config)?;
+    let (runtime, provided, test) = lock_parts(client, &config, offline)?;
 
     if runtime.is_empty() && provided.is_empty() && test.is_empty() {
         println!("no dependencies");

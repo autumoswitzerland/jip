@@ -109,14 +109,17 @@ pub struct Resolver {
     repos: Vec<String>,
     /// POMs fetched during this run, keyed by `group:artifact:version`.
     pom_cache: HashMap<String, Pom>,
+    /// Use only locally cached POMs; fail when a POM is not cached.
+    offline: bool,
 }
 
 impl Resolver {
-    pub fn new(client: reqwest::blocking::Client, repos: &[String]) -> Self {
+    pub fn new(client: reqwest::blocking::Client, repos: &[String], offline: bool) -> Self {
         Self {
             client,
             repos: repos.to_vec(),
             pom_cache: HashMap::new(),
+            offline,
         }
     }
 
@@ -390,6 +393,10 @@ impl Resolver {
         let pom_path = format!("{}{}", artifact.directory(), artifact.pom_file_name());
         let mut tried = Vec::new();
         for repo in &self.repos {
+            // In offline mode, skip HTTP repos — only check file:// repos
+            if self.offline && !repo.starts_with("file://") {
+                continue;
+            }
             match download_repo_text(&self.client, repo, &pom_path) {
                 Ok(xml) => {
                     let pom = parse_pom(&xml)
@@ -425,6 +432,9 @@ impl Resolver {
             );
             return Ok(());
         }
+        if self.offline {
+            bail!("POM for {key} is not cached — run without --offline to download it");
+        }
         bail!(
             "cannot download POM for {key} — not found in any repository:\n{}\n\
              check the version, or fix the [repositories] entries in {}",
@@ -435,7 +445,7 @@ impl Resolver {
 
     /// The repository that carries the artifact's jar, when the POM is
     /// missing.  `file://` repositories are checked on disk; HTTP
-    /// repositories via a HEAD request.
+    /// repositories via a HEAD request (skipped in offline mode).
     fn jar_exists(&self, artifact: &Artifact) -> Option<String> {
         let jar_path = format!("{}{}", artifact.directory(), artifact.jar_file_name());
         for repo in &self.repos {
@@ -443,7 +453,7 @@ impl Resolver {
                 if base_dir.join(&jar_path).is_file() {
                     return Some(repo.clone());
                 }
-            } else {
+            } else if !self.offline {
                 let url = format!("{repo}/{jar_path}");
                 if self
                     .client
@@ -576,7 +586,7 @@ mod tests {
         std::fs::write(artifact_dir.join("widget-1.0.0.jar"), b"jar bytes").unwrap();
 
         let repo_url = format!("file://{}", dir.join("repo").display());
-        let mut resolver = Resolver::new(reqwest::blocking::Client::new(), &[repo_url]);
+        let mut resolver = Resolver::new(reqwest::blocking::Client::new(), &[repo_url], false);
         let artifact = Artifact::parse("com.example:widget:1.0.0").unwrap();
         resolver.fetch_pom(&artifact).unwrap();
 
@@ -590,7 +600,7 @@ mod tests {
 
     #[test]
     fn missing_pom_and_jar_is_an_error() {
-        let mut resolver = Resolver::new(reqwest::blocking::Client::new(), &[]);
+        let mut resolver = Resolver::new(reqwest::blocking::Client::new(), &[], false);
         let artifact = Artifact::parse("com.example:missing:1.0.0").unwrap();
         let err = resolver.fetch_pom(&artifact).unwrap_err();
         assert!(format!("{err:#}").contains("cannot download POM"));

@@ -27,6 +27,10 @@ use clap::{Parser, Subcommand};
 #[derive(Debug, Parser)]
 #[command(name = "jip", version, about, long_about = None)]
 pub struct Jip {
+    /// Use only locally cached jars; fail when a dependency is not cached.
+    #[arg(global = true, long)]
+    pub offline: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }

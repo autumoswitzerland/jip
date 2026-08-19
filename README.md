@@ -249,6 +249,10 @@ source = "src/main/java"         # optional: defaults to src/main/java
 [cache]
 use-m2 = true                    # reuse jars from ~/.m2/repository
 
+[proxy]                           # optional: HTTP/HTTPS proxy
+http-proxy = "http://proxy:8080"
+https-proxy = "http://proxy:8443"
+
 [classpath]                      # optional: extra classpath entries
 extra = ["lib/foo.jar", "config"]  # runtime + test
 test-extra = ["src/test/resources"]  # jip test only
@@ -284,6 +288,26 @@ extra = ["lib/my-custom.jar", "resources"]
 ### `[repositories]`
 
 Custom Maven repositories tried before Maven Central. Keys are arbitrary names, values are base URLs. Supports `https://` and `file://` (local Maven-style folders). During conversion, Maven's `${project.basedir}` and Gradle's `$projectDir` are resolved against the project directory.
+
+### `[proxy]`
+
+HTTP/HTTPS proxy configuration. Can also be set via `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` environment variables (env vars take precedence when the config is empty).
+
+```toml
+[proxy]
+http-proxy = "http://proxy:8080"
+https-proxy = "http://proxy:8443"
+```
+
+### `--offline`
+
+Global flag that disables all network access. Dependencies are resolved only from locally cached jars (`~/.cache/jip` and `~/.m2/repository` when `use-m2 = true`). Missing dependencies cause an error instead of a download attempt.
+
+```bash
+jip build --offline
+jip run --offline
+jip test --offline
+```
 
 ### Dependency scopes
 

@@ -40,6 +40,7 @@ use crate::convert::{self, ConversionOffer};
 /// Run the project's main class with all dependencies on the classpath.
 pub fn run(
     client: &reqwest::blocking::Client,
+    offline: bool,
     main_arg: Option<&str>,
     defines: &[String],
     program_args: &[String],
@@ -53,7 +54,7 @@ pub fn run(
     };
 
     // Lazily download every jar that is not yet cached.
-    let classpath = classpath_for(client, &config)?;
+    let classpath = classpath_for(client, &config, offline)?;
 
     check_java_version(config.project.java.as_deref())?;
 
@@ -120,7 +121,7 @@ pub fn run(
         MainTarget::Class(name) => {
             // Provided dependencies are compile-time only: javac sees them,
             // the running program does not.
-            let compile_classpath = compile_classpath_for(client, &config)?;
+            let compile_classpath = compile_classpath_for(client, &config, offline)?;
             build::compile(&config, &compile_classpath)?;
             let mut run_classpath = vec![PathBuf::from(build::CLASSES_DIR)];
             run_classpath.extend(classpath);

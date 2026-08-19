@@ -43,7 +43,7 @@ use cli::{Command, Jip};
 
 fn main() -> ExitCode {
     let args = Jip::parse();
-    match run(args.command) {
+    match run(args.offline, args.command) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("{} {err:#}", console::red(&console::bold("jip: error:")));
@@ -53,34 +53,36 @@ fn main() -> ExitCode {
 }
 
 /// Dispatch to the command module for the parsed subcommand.
-fn run(command: Command) -> anyhow::Result<()> {
+fn run(offline: bool, command: Command) -> anyhow::Result<()> {
     let client = commands::new_client();
     match command {
-        Command::Init => commands::init::run(&client),
+        Command::Init => commands::init::run(&client, offline),
         Command::Add {
             dependency,
             test,
             provided,
-        } => commands::add::run(&client, &dependency, test, provided),
+        } => commands::add::run(&client, offline, &dependency, test, provided),
         Command::Remove {
             dependency,
             test,
             provided,
-        } => commands::remove::run(&client, &dependency, test, provided),
-        Command::Resolve => commands::resolve::run(&client),
-        Command::Build => commands::build::run(&client),
+        } => commands::remove::run(&client, offline, &dependency, test, provided),
+        Command::Resolve => commands::resolve::run(&client, offline),
+        Command::Build => commands::build::run(&client, offline),
         Command::Run {
             main,
             defines,
             args,
-        } => commands::run::run(&client, main.as_deref(), &defines, &args),
-        Command::Jar { fat } => commands::jar::run(&client, fat),
-        Command::Test => commands::test::run(&client),
+        } => commands::run::run(&client, offline, main.as_deref(), &defines, &args),
+        Command::Jar { fat } => commands::jar::run(&client, offline, fat),
+        Command::Test => commands::test::run(&client, offline),
         Command::Search { query } => commands::search::run(&client, &query),
-        Command::Tree => commands::tree::run(&client),
-        Command::Update { dependency } => commands::update::run(&client, dependency.as_deref()),
+        Command::Tree => commands::tree::run(&client, offline),
+        Command::Update { dependency } => {
+            commands::update::run(&client, offline, dependency.as_deref())
+        }
         Command::Outdated => commands::outdated::run(&client),
-        Command::List => commands::list::run(&client),
+        Command::List => commands::list::run(&client, offline),
         Command::Clean => commands::clean::run(),
         Command::Completion { shell } => commands::completion::run(&shell),
         Command::Java { command } => match command {

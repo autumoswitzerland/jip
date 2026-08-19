@@ -46,15 +46,18 @@ pub struct Cache {
     pub cache_root: PathBuf,
     /// Reuse jars from `~/.m2/repository` when present.
     pub use_m2: bool,
+    /// Use only locally cached jars; fail when a dependency is not cached.
+    pub offline: bool,
     /// HTTP client used for downloads.
     client: reqwest::blocking::Client,
 }
 
 impl Cache {
-    pub fn new(client: reqwest::blocking::Client, use_m2: bool) -> Self {
+    pub fn new(client: reqwest::blocking::Client, use_m2: bool, offline: bool) -> Self {
         Self {
             cache_root: default_cache_root(),
             use_m2,
+            offline,
             client,
         }
     }
@@ -91,10 +94,19 @@ impl Cache {
     /// Make sure the jar for `artifact` is available locally, downloading it
     /// (and verifying its SHA-1 checksum) when it is missing.
     ///
+    /// In offline mode, only cached jars are accepted; missing jars cause an
+    /// error instead of a download attempt.
+    ///
     /// `repos` are tried in order; the first repository that has the jar wins.
     pub fn ensure_jar(&self, artifact: &Artifact, repos: &[String]) -> anyhow::Result<PathBuf> {
         if let Some(path) = self.existing_jar(artifact) {
             return Ok(path);
+        }
+        if self.offline {
+            bail!(
+                "{} is not cached — run without --offline to download it",
+                artifact.jar_file_name()
+            );
         }
         self.download_jar(artifact, repos)
     }
@@ -291,7 +303,7 @@ mod tests {
 
     #[test]
     fn cache_paths_follow_repository_layout() {
-        let cache = Cache::new(reqwest::blocking::Client::new(), false);
+        let cache = Cache::new(reqwest::blocking::Client::new(), false, false);
         let artifact = Artifact::parse("com.google.guava:guava:33.0.0-jre").unwrap();
         assert!(
             cache
@@ -311,5 +323,15 @@ mod tests {
             Some(PathBuf::from("/srv/repo"))
         );
         assert_eq!(file_url_path("https://repo1.maven.org/maven2"), None);
+    }
+
+    #[test]
+    fn offline_ensure_jar_fails_for_missing_artifact() {
+        let cache = Cache::new(reqwest::blocking::Client::new(), false, true);
+        let artifact = Artifact::parse("com.example.nonexistent:forgifact:99.99.99-zzz").unwrap();
+        let repos = vec!["https://repo1.maven.org/maven2".to_string()];
+        let result = cache.ensure_jar(&artifact, &repos);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("is not cached"));
     }
 }

@@ -992,6 +992,7 @@ pub fn convert_project(client: &reqwest::blocking::Client) -> anyhow::Result<Pro
             source: None,
         },
         cache: CacheSettings::default(),
+        proxy: crate::config::ProxySettings::default(),
         classpath: crate::config::ClasspathSettings::default(),
         repositories: BTreeMap::new(),
         dependencies: BTreeMap::new(),
@@ -1045,9 +1046,9 @@ pub fn convert_project(client: &reqwest::blocking::Client) -> anyhow::Result<Pro
 
     config.save(Path::new(CONFIG_FILE))?;
 
-    let resolution = resolve(client, &config)?;
-    let provided = resolve_provided(client, &config)?;
-    let tests = resolve_tests(client, &config)?;
+    let resolution = resolve(client, &config, false)?;
+    let provided = resolve_provided(client, &config, false)?;
+    let tests = resolve_tests(client, &config, false)?;
     write_lock(&resolution.flat, &provided.flat, &tests.flat)?;
     Ok(config)
 }

@@ -54,11 +54,45 @@ use crate::resolver::{DEFAULT_REPO_URL, Resolution, Resolver};
 /// The jip version, taken from Cargo.toml at compile time.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Build the shared HTTP client with a sensible user agent and timeout.
+/// Build the shared HTTP client with a sensible user agent, timeout,
+/// and optional proxy configuration from env vars or `jip.toml`.
 pub fn new_client() -> Client {
-    Client::builder()
+    let mut builder = Client::builder()
         .user_agent(format!("jip/{VERSION}"))
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(std::time::Duration::from_secs(60));
+
+    // Read proxy from jip.toml, fall back to env vars
+    let config = load_config().ok();
+    let proxy_cfg = config.as_ref().and_then(|c| {
+        if c.proxy.http_proxy.is_some() || c.proxy.https_proxy.is_some() {
+            Some(&c.proxy)
+        } else {
+            None
+        }
+    });
+
+    let http_proxy = proxy_cfg
+        .and_then(|p| p.http_proxy.clone())
+        .or_else(|| std::env::var("HTTP_PROXY").ok())
+        .or_else(|| std::env::var("http_proxy").ok());
+
+    let https_proxy = proxy_cfg
+        .and_then(|p| p.https_proxy.clone())
+        .or_else(|| std::env::var("HTTPS_PROXY").ok())
+        .or_else(|| std::env::var("https_proxy").ok());
+
+    if let Some(url) = http_proxy
+        && let Ok(proxy) = reqwest::Proxy::http(&url)
+    {
+        builder = builder.proxy(proxy);
+    }
+    if let Some(url) = https_proxy
+        && let Ok(proxy) = reqwest::Proxy::https(&url)
+    {
+        builder = builder.proxy(proxy);
+    }
+
+    builder
         .build()
         .expect("building the HTTP client never fails")
 }
@@ -84,21 +118,33 @@ pub fn repositories_for(config: &ProjectConfig) -> Vec<String> {
 }
 
 /// Run a full resolution for the project's runtime dependencies.
-pub fn resolve(client: &Client, config: &ProjectConfig) -> anyhow::Result<Resolution> {
-    let mut resolver = Resolver::new(client.clone(), &repositories_for(config));
+pub fn resolve(
+    client: &Client,
+    config: &ProjectConfig,
+    offline: bool,
+) -> anyhow::Result<Resolution> {
+    let mut resolver = Resolver::new(client.clone(), &repositories_for(config), offline);
     resolver.resolve_project(config)
 }
 
 /// Run a full resolution for the project's test dependencies.
-pub fn resolve_tests(client: &Client, config: &ProjectConfig) -> anyhow::Result<Resolution> {
-    let mut resolver = Resolver::new(client.clone(), &repositories_for(config));
+pub fn resolve_tests(
+    client: &Client,
+    config: &ProjectConfig,
+    offline: bool,
+) -> anyhow::Result<Resolution> {
+    let mut resolver = Resolver::new(client.clone(), &repositories_for(config), offline);
     resolver.resolve_project_tests(config)
 }
 
 /// Run a full resolution for the project's compile-only (`provided`)
 /// dependencies.
-pub fn resolve_provided(client: &Client, config: &ProjectConfig) -> anyhow::Result<Resolution> {
-    let mut resolver = Resolver::new(client.clone(), &repositories_for(config));
+pub fn resolve_provided(
+    client: &Client,
+    config: &ProjectConfig,
+    offline: bool,
+) -> anyhow::Result<Resolution> {
+    let mut resolver = Resolver::new(client.clone(), &repositories_for(config), offline);
     resolver.resolve_project_provided(config)
 }
 
@@ -118,8 +164,8 @@ pub fn write_lock(
 }
 
 /// A cache configured from the project's settings.
-pub fn cache_for(client: &Client, config: &ProjectConfig) -> Cache {
-    Cache::new(client.clone(), config.cache.use_m2)
+pub fn cache_for(client: &Client, config: &ProjectConfig, offline: bool) -> Cache {
+    Cache::new(client.clone(), config.cache.use_m2, offline)
 }
 
 /// Download any jar that is not yet available locally.
@@ -138,6 +184,7 @@ pub fn ensure_jars(cache: &Cache, artifacts: &[Artifact], repos: &[String]) -> a
 pub fn lock_parts(
     client: &Client,
     config: &ProjectConfig,
+    offline: bool,
 ) -> anyhow::Result<(Vec<Artifact>, Vec<Artifact>, Vec<Artifact>)> {
     if let Some(lock) = LockFile::load(Path::new(LOCK_FILE))? {
         let runtime = lock.packages.iter().map(|p| p.to_artifact()).collect();
@@ -149,25 +196,33 @@ pub fn lock_parts(
         let test = lock.test_packages.iter().map(|p| p.to_artifact()).collect();
         return Ok((runtime, provided, test));
     }
-    let resolution = resolve(client, config)?;
-    let provided = resolve_provided(client, config)?;
-    let tests = resolve_tests(client, config)?;
+    let resolution = resolve(client, config, offline)?;
+    let provided = resolve_provided(client, config, offline)?;
+    let tests = resolve_tests(client, config, offline)?;
     write_lock(&resolution.flat, &provided.flat, &tests.flat)?;
     Ok((resolution.flat, provided.flat, tests.flat))
 }
 
 /// The pinned runtime artifacts from `jip.lock`.
-pub fn locked_artifacts(client: &Client, config: &ProjectConfig) -> anyhow::Result<Vec<Artifact>> {
-    Ok(lock_parts(client, config)?.0)
+pub fn locked_artifacts(
+    client: &Client,
+    config: &ProjectConfig,
+    offline: bool,
+) -> anyhow::Result<Vec<Artifact>> {
+    Ok(lock_parts(client, config, offline)?.0)
 }
 
 /// The resolved runtime dependency jars, downloading anything that is not
 /// cached yet, plus the configured `[classpath] extra` entries.
-pub fn classpath_for(client: &Client, config: &ProjectConfig) -> anyhow::Result<Vec<PathBuf>> {
-    let cache = cache_for(client, config);
+pub fn classpath_for(
+    client: &Client,
+    config: &ProjectConfig,
+    offline: bool,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let cache = cache_for(client, config, offline);
     let repos = repositories_for(config);
     let mut classpath = Vec::new();
-    for artifact in locked_artifacts(client, config)? {
+    for artifact in locked_artifacts(client, config, offline)? {
         classpath.push(cache.ensure_jar(&artifact, &repos)?);
     }
     classpath.extend(classpath_extras(&config.classpath.extra));
@@ -177,10 +232,14 @@ pub fn classpath_for(client: &Client, config: &ProjectConfig) -> anyhow::Result<
 /// The runtime and test dependency jars, downloading anything that is not
 /// cached yet, plus the configured `[classpath]` entries.  This is the
 /// classpath `jip test` works with.
-pub fn test_classpath_for(client: &Client, config: &ProjectConfig) -> anyhow::Result<Vec<PathBuf>> {
-    let cache = cache_for(client, config);
+pub fn test_classpath_for(
+    client: &Client,
+    config: &ProjectConfig,
+    offline: bool,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let cache = cache_for(client, config, offline);
     let repos = repositories_for(config);
-    let (runtime, _, test) = lock_parts(client, config)?;
+    let (runtime, _, test) = lock_parts(client, config, offline)?;
     let mut classpath = Vec::new();
     for artifact in runtime.into_iter().chain(test) {
         classpath.push(cache.ensure_jar(&artifact, &repos)?);
@@ -198,11 +257,12 @@ pub fn test_classpath_for(client: &Client, config: &ProjectConfig) -> anyhow::Re
 pub fn provided_classpath_for(
     client: &Client,
     config: &ProjectConfig,
+    offline: bool,
 ) -> anyhow::Result<Vec<PathBuf>> {
-    let cache = cache_for(client, config);
+    let cache = cache_for(client, config, offline);
     let repos = repositories_for(config);
     let mut classpath = Vec::new();
-    for artifact in lock_parts(client, config)?.1 {
+    for artifact in lock_parts(client, config, offline)?.1 {
         classpath.push(cache.ensure_jar(&artifact, &repos)?);
     }
     Ok(classpath)
@@ -214,9 +274,10 @@ pub fn provided_classpath_for(
 pub fn compile_classpath_for(
     client: &Client,
     config: &ProjectConfig,
+    offline: bool,
 ) -> anyhow::Result<Vec<PathBuf>> {
-    let mut classpath = classpath_for(client, config)?;
-    classpath.extend(provided_classpath_for(client, config)?);
+    let mut classpath = classpath_for(client, config, offline)?;
+    classpath.extend(provided_classpath_for(client, config, offline)?);
     Ok(classpath)
 }
 

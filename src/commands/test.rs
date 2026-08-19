@@ -42,7 +42,7 @@ pub const TEST_SOURCE_DIR: &str = "src/test/java";
 pub const TEST_CLASSES_DIR: &str = "target/test-classes";
 
 /// Compile and run the project's JUnit tests.
-pub fn run(client: &reqwest::blocking::Client) -> anyhow::Result<()> {
+pub fn run(client: &reqwest::blocking::Client, offline: bool) -> anyhow::Result<()> {
     // Offer to convert a detected Maven/Gradle project when jip.toml is
     // missing, just like `jip build` and `jip run`.
     let config = match convert::offer_conversion(client)? {
@@ -62,7 +62,7 @@ pub fn run(client: &reqwest::blocking::Client) -> anyhow::Result<()> {
     }
 
     // Lazily download every jar that is not yet cached.
-    let test_classpath = test_classpath_for(client, &config)?;
+    let test_classpath = test_classpath_for(client, &config, offline)?;
     let standalone = test_classpath
         .iter()
         .find(|path| is_console_standalone(path))
@@ -74,10 +74,10 @@ pub fn run(client: &reqwest::blocking::Client) -> anyhow::Result<()> {
 
     // The main classes compile against runtime plus provided dependencies;
     // the tests additionally see the test dependencies.
-    let compile_classpath = compile_classpath_for(client, &config)?;
+    let compile_classpath = compile_classpath_for(client, &config, offline)?;
     build::compile(&config, &compile_classpath)?;
 
-    let provided = provided_classpath_for(client, &config)?;
+    let provided = provided_classpath_for(client, &config, offline)?;
     let mut test_compile_classpath = vec![PathBuf::from(CLASSES_DIR)];
     test_compile_classpath.extend(provided);
     test_compile_classpath.extend(test_classpath.iter().cloned());

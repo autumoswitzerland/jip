@@ -409,11 +409,30 @@ pub fn install(client: &Client, vendor: Vendor, version: &str) -> anyhow::Result
     let tar_path = tmp_dir.join(format!("{vendor}-{version}.tar.gz"));
 
     // Separate client with longer timeout for large JDK downloads (~200MB).
-    let dl_client = Client::builder()
+    let mut builder = Client::builder()
         .user_agent(format!("jip/{}", env!("CARGO_PKG_VERSION")))
-        .timeout(std::time::Duration::from_secs(600))
-        .build()
-        .context("building download client")?;
+        .timeout(std::time::Duration::from_secs(600));
+
+    // Apply proxy from env vars
+    let http_proxy = std::env::var("HTTP_PROXY")
+        .or_else(|_| std::env::var("http_proxy"))
+        .ok();
+    let https_proxy = std::env::var("HTTPS_PROXY")
+        .or_else(|_| std::env::var("https_proxy"))
+        .ok();
+
+    if let Some(url) = http_proxy
+        && let Ok(proxy) = reqwest::Proxy::http(&url)
+    {
+        builder = builder.proxy(proxy);
+    }
+    if let Some(url) = https_proxy
+        && let Ok(proxy) = reqwest::Proxy::https(&url)
+    {
+        builder = builder.proxy(proxy);
+    }
+
+    let dl_client = builder.build().context("building download client")?;
 
     let mut response = dl_client
         .get(&url)

@@ -67,13 +67,13 @@ pub enum MainDecision {
 }
 
 /// The `jip build` command: compile everything, unless already up to date.
-pub fn run(client: &reqwest::blocking::Client) -> anyhow::Result<()> {
+pub fn run(client: &reqwest::blocking::Client, offline: bool) -> anyhow::Result<()> {
     let config = match convert::offer_conversion(client)? {
         ConversionOffer::Converted(config) => config,
         ConversionOffer::Declined => return Ok(()),
         ConversionOffer::Proceed => Box::new(load_config()?),
     };
-    let classpath = compile_classpath_for(client, &config)?;
+    let classpath = compile_classpath_for(client, &config, offline)?;
     check_java_version(config.project.java.as_deref())?;
     compile(&config, &classpath)
 }
