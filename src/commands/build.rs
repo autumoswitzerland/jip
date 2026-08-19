@@ -85,7 +85,7 @@ pub fn run(client: &reqwest::blocking::Client, offline: bool) -> anyhow::Result<
 }
 
 /// Build all modules in topological order.
-fn run_multi_module(
+pub(crate) fn run_multi_module(
     client: &reqwest::blocking::Client,
     root_config: &ProjectConfig,
     offline: bool,

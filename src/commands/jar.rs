@@ -29,13 +29,13 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{IsTerminal, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use zip::ZipArchive;
 use zip::write::SimpleFileOptions;
 
-use crate::commands::build;
+use crate::commands::build::{self, MainTarget};
 use crate::commands::{classpath_for, compile_classpath_for, load_config};
 use crate::config::{CONFIG_FILE, ProjectConfig};
 use crate::console;
@@ -54,19 +54,121 @@ pub fn run(client: &reqwest::blocking::Client, offline: bool, fat: bool) -> anyh
         ConversionOffer::Proceed => Box::new(load_config()?),
     };
 
+    // Multi-module jar: build every module, then merge all module classes
+    // (plus all dependencies for a fat jar) into a single jar.
+    if crate::multi::is_multi_module(&config) {
+        return run_multi_module(client, &mut config, offline, fat);
+    }
+
     let compile_classpath = compile_classpath_for(client, &config, offline)?;
     build::compile(&config, &compile_classpath)?;
 
     let main_class = resolve_main_class(&config)?;
+    let classes_dirs = vec![PathBuf::from(build::CLASSES_DIR)];
 
     if fat {
-        build_fat_jar(client, &config, &main_class, offline)?;
+        let deps = classpath_for(client, &config, offline)?;
+        build_fat_jar(&classes_dirs, &deps, &main_class)?;
     } else {
-        build_thin_jar(&config, &main_class)?;
+        build_thin_jar(&classes_dirs, &main_class)?;
         offer_classpath_extra(&mut config)?;
     }
 
     Ok(())
+}
+
+/// Jar a multi-module project: compile every module in topological order,
+/// then merge the module classes (and all their dependencies for a fat jar)
+/// into a single Über-jar.
+fn run_multi_module(
+    client: &reqwest::blocking::Client,
+    config: &mut ProjectConfig,
+    offline: bool,
+    fat: bool,
+) -> anyhow::Result<()> {
+    // Compile all modules first; `jip jar` packages compiled classes.
+    build::run_multi_module(client, config, offline)?;
+
+    let layout = crate::multi::detect_multi_module()
+        .context("multi-module config found but cannot detect module layout")?;
+    let root_dir = std::env::current_dir()?;
+    let sorted = crate::multi::topological_sort(&layout.modules)?;
+
+    // Collect each module's compiled classes, in dependency order.
+    let mut classes_dirs = Vec::new();
+    for module in &sorted {
+        let classes = crate::multi::module_classes_dir(&root_dir, &module.path);
+        if classes.is_dir() {
+            classes_dirs.push(classes);
+        }
+    }
+    if classes_dirs.is_empty() {
+        bail!("no module classes found under any module — run `jip build` first");
+    }
+
+    let main_class = resolve_multi_main_class(config, &root_dir, &sorted)?;
+
+    if fat {
+        // Merge the runtime dependency jars of every module.
+        let mut deps = Vec::new();
+        let original_dir = std::env::current_dir()?;
+        for module in &sorted {
+            let module_config = crate::multi::load_module_config(&root_dir, &module.path)?;
+            std::env::set_current_dir(root_dir.join(&module.path))?;
+            deps.extend(classpath_for(client, &module_config, offline)?);
+        }
+        std::env::set_current_dir(&original_dir)?;
+        build_fat_jar(&classes_dirs, &deps, &main_class)?;
+    } else {
+        build_thin_jar(&classes_dirs, &main_class)?;
+    }
+
+    Ok(())
+}
+
+/// Resolve the main class for a multi-module project: the root `[project]
+/// main` first, otherwise scan every module for a class with a `main` method.
+fn resolve_multi_main_class(
+    config: &mut ProjectConfig,
+    root_dir: &Path,
+    sorted: &[crate::multi::ModuleInfo],
+) -> anyhow::Result<Option<String>> {
+    if let Some(main) = &config.project.main {
+        return Ok(Some(main.clone()));
+    }
+
+    let mut candidates = Vec::new();
+    for module in sorted {
+        let module_config = crate::multi::load_module_config(root_dir, &module.path)?;
+        let original_dir = std::env::current_dir()?;
+        std::env::set_current_dir(root_dir.join(&module.path))?;
+        if let Ok(cands) = build::main_candidates(&module_config) {
+            candidates.extend(cands);
+        }
+        std::env::set_current_dir(&original_dir)?;
+    }
+    candidates.sort();
+    candidates.dedup();
+
+    match candidates.len() {
+        0 => Ok(None),
+        1 => Ok(Some(candidates[0].clone())),
+        _ => {
+            let target = build::choose_main(&candidates)?;
+            if let build::MainTarget::Class(fqcn) = &target {
+                config.project.main = Some(fqcn.clone());
+                config.save(Path::new(CONFIG_FILE))?;
+                println!(
+                    "{}",
+                    crate::console::green(&format!("saved [project] main = \"{fqcn}\""))
+                );
+            }
+            let MainTarget::Class(fqcn) = target else {
+                unreachable!("choose_main only yields class targets");
+            };
+            Ok(Some(fqcn))
+        }
+    }
 }
 
 /// Resolve the main class for the manifest's `Main-Class` entry.
@@ -81,14 +183,12 @@ fn resolve_main_class(config: &ProjectConfig) -> anyhow::Result<Option<String>> 
     Ok(None)
 }
 
-/// Build a thin jar from `target/classes`.
-fn build_thin_jar(_config: &ProjectConfig, main_class: &Option<String>) -> anyhow::Result<()> {
-    let classes_dir = Path::new(build::CLASSES_DIR);
-    if !classes_dir.is_dir() {
-        bail!(
-            "{} does not exist — run `jip build` first",
-            classes_dir.display()
-        );
+/// Build a thin jar from one or more `target/classes` directories.
+fn build_thin_jar(classes_dirs: &[PathBuf], main_class: &Option<String>) -> anyhow::Result<()> {
+    for dir in classes_dirs {
+        if !dir.is_dir() {
+            bail!("{} does not exist — run `jip build` first", dir.display());
+        }
     }
 
     let jar_path = Path::new(JAR_PATH);
@@ -107,14 +207,16 @@ fn build_thin_jar(_config: &ProjectConfig, main_class: &Option<String>) -> anyho
     let mut seen = BTreeSet::new();
     seen.insert("META-INF/MANIFEST.MF".to_string());
     let mut duplicates = Vec::<String>::new();
-    add_directory_contents_tracking(
-        &mut zip,
-        classes_dir,
-        classes_dir,
-        options,
-        &mut seen,
-        &mut duplicates,
-    )?;
+    for classes_dir in classes_dirs {
+        add_directory_contents_tracking(
+            &mut zip,
+            classes_dir,
+            classes_dir,
+            options,
+            &mut seen,
+            &mut duplicates,
+        )?;
+    }
     zip.finish()?;
 
     let size = fs::metadata(jar_path).map(|m| m.len()).unwrap_or(0);
@@ -131,20 +233,16 @@ fn build_thin_jar(_config: &ProjectConfig, main_class: &Option<String>) -> anyho
 
 /// Build a fat jar: project classes + all dependency jars merged.
 fn build_fat_jar(
-    client: &reqwest::blocking::Client,
-    config: &ProjectConfig,
+    classes_dirs: &[PathBuf],
+    dep_jars: &[PathBuf],
     main_class: &Option<String>,
-    offline: bool,
 ) -> anyhow::Result<()> {
-    let classes_dir = Path::new(build::CLASSES_DIR);
-    if !classes_dir.is_dir() {
-        bail!(
-            "{} does not exist — run `jip build` first",
-            classes_dir.display()
-        );
+    for dir in classes_dirs {
+        if !dir.is_dir() {
+            bail!("{} does not exist — run `jip build` first", dir.display());
+        }
     }
 
-    let classpath = classpath_for(client, config, offline)?;
     let fat_path = Path::new(FAT_JAR_PATH);
     fs::create_dir_all(fat_path.parent().unwrap())
         .with_context(|| format!("cannot create {}", fat_path.parent().unwrap().display()))?;
@@ -164,17 +262,19 @@ fn build_fat_jar(
     let mut duplicates: Vec<String> = Vec::new();
 
     // Add project classes first (they win over dependency entries).
-    add_directory_contents_tracking(
-        &mut zip,
-        classes_dir,
-        classes_dir,
-        options,
-        &mut seen,
-        &mut duplicates,
-    )?;
+    for classes_dir in classes_dirs {
+        add_directory_contents_tracking(
+            &mut zip,
+            classes_dir,
+            classes_dir,
+            options,
+            &mut seen,
+            &mut duplicates,
+        )?;
+    }
 
     // Merge dependency jars.
-    for jar in &classpath {
+    for jar in dep_jars {
         if jar.is_file() {
             merge_jar(&mut zip, jar, &mut seen, &mut duplicates, options)?;
         }
@@ -205,7 +305,7 @@ fn build_fat_jar(
             "created {} ({:.1} KB, {} dependencies)",
             fat_path.display(),
             size as f64 / 1024.0,
-            classpath.len()
+            dep_jars.len()
         ))
     );
     Ok(())

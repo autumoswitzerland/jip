@@ -35,6 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     are excluded from external resolution.
   - `jip build` compiles modules in topological (dependency) order.
   - `jip run` flattens all module classes onto the classpath.
+  - `jip jar` / `jip jar --fat` merge all module classes (and their
+    dependencies) into a single thin or uber jar.
   - Gradle `subprojects {}` / `allprojects {}` dependency and repository
     propagation to child modules (module-local versions override inherited).
 - Main class auto-detection with an interactive picker when several

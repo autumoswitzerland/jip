@@ -41,7 +41,7 @@
 - **Gradle version catalogs** — `gradle/libs.versions.toml` `[libraries]` + `[versions]` are resolved automatically
 - **JDK management** — `jip java install/use/list/remove` manages JDK installations from multiple vendors
 - **Offline mode** — `--offline` flag uses only locally cached jars, no network access
-- **Multi-module projects** — Maven multi-module and Gradle multi-project builds are detected automatically; `jip init` creates a root config with `[modules]` and per-module `jip.toml` files; `jip build` compiles modules in dependency order; `jip run` flattens all module classes onto the classpath
+- **Multi-module projects** — Maven multi-module and Gradle multi-project builds are detected automatically; `jip init` creates a root config with `[modules]` and per-module `jip.toml` files; `jip build` compiles modules in dependency order; `jip run` flattens all module classes onto the classpath; `jip jar` / `jip jar --fat` merge all module classes (and dependencies) into a single jar
 - **Proxy support** — HTTP/HTTPS proxy via `[proxy]` in `jip.toml` or `HTTP_PROXY`/`HTTPS_PROXY` env vars
 
 ## Quick Start
@@ -154,6 +154,8 @@ jip jar --fat                        # fat jar → target/app-fat.jar (all deps 
 Thin jar: only the project's compiled classes. After building, jip asks whether to add the jar to `[classpath] extra`.
 
 Fat jar: all dependency jars are unpacked and merged into a single uber jar. Signature files (`.SF`, `.RSA`, `.DSA`) and duplicate metadata (`NOTICE`, `LICENSE`) from dependencies are excluded. Duplicate resources are overwritten (last-wins) with a warning listing affected files.
+
+For **multi-module projects**, `jip jar` compiles every module in dependency order and merges all module classes into the jar. `jip jar --fat` additionally merges the runtime dependencies of every module, so the resulting uber jar is self-contained. The main class is resolved from the root `[project] main` or detected by scanning all modules; an ambiguous match opens the interactive picker.
 
 ### `jip test`
 
@@ -450,7 +452,7 @@ target/app.jar    thin jar (jip jar)
 target/app-fat.jar    fat/uber jar (jip jar --fat)
 ```
 
-For multi-module projects, the root directory contains the root `jip.toml` with `[modules]`, and each module subdirectory has its own `jip.toml`, `jip.lock`, and `target/classes/`.
+For multi-module projects, the root directory contains the root `jip.toml` with `[modules]`, and each module subdirectory has its own `jip.toml`, `jip.lock`, and `target/classes/`. `jip jar` / `jip jar --fat` written from the root merge all module classes into the root `target/app.jar` / `target/app-fat.jar`.
 
 - **Resolution:** walks transitive dependencies from Maven Central (or custom repos), applies conflict resolution, writes `jip.lock`
 - **Compilation:** `javac` with the resolved classpath, skip-when-up-to-date based on file timestamps

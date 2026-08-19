@@ -628,9 +628,9 @@ mod tests {
     #[test]
     fn temurin_url_pattern() {
         // Verify URL pattern without hitting the network
-        let url = format!(
+        let url =
             "https://api.adoptium.net/v3/binary/latest/21/ga/mac/aarch64/jdk/hotspot/normal/eclipse"
-        );
+                .to_string();
         assert!(url.starts_with("https://api.adoptium.net/v3/binary/latest/21/ga/"));
         assert!(url.contains("/jdk/hotspot/normal/eclipse"));
     }
