@@ -42,7 +42,7 @@
 - **JDK management** — `jip java install/use/list/remove` manages JDK installations from multiple vendors
 - **Offline mode** — `--offline` flag uses only locally cached jars, no network access
 - **Multi-module projects** — Maven multi-module and Gradle multi-project builds are detected automatically; `jip init` creates a root config with `[modules]` and per-module `jip.toml` files; `jip build` compiles modules in dependency order; `jip run` compiles lazily and flattens all module classes onto the classpath; `jip jar` / `jip jar --fat` merge all module classes (and dependencies) into a single jar
-- **`jip get`** — clone any git repository and run it in one step; Maven/Gradle builds are converted automatically (non-interactive), dependencies are lazily fetched, and the main class is detected or picked
+- **`jip get`** — clone any git repository into `./<repo-name>/` and convert a Maven/Gradle build to `jip.toml` automatically (non-interactive); running cloned code stays an explicit trust decision (`cd <name> && jip run`)
 - **Proxy support** — HTTP/HTTPS proxy via `[proxy]` in `jip.toml` or `HTTP_PROXY`/`HTTPS_PROXY` env vars
 
 ## Quick Start
@@ -70,8 +70,8 @@ Or in a single step without touching your working directory:
 
 ```bash
 jip get https://github.com/example/app.git
-# → Cloning into 'app'... converts pom.xml / build.gradle automatically, downloads deps, runs
-#   Arguments after `--` are passed to the program: jip get https://github.com/example/app.git -- start
+# → Cloning into 'app'... converts pom.xml / build.gradle automatically
+#   and prints: next: inspect the code first, then run it with `cd app && jip run`
 ```
 
 ### From an existing Maven project
@@ -91,7 +91,7 @@ jip run            # runs with the converted dependencies
 | `jip remove <dep>` | Remove a dependency |
 | `jip resolve` | Re-resolve all dependencies and write `jip.lock` |
 | `jip build` | Compile sources into `target/classes` |
-| `jip get <url>` | Clone a git repository into `./<repo-name>/` and run it |
+| `jip get <url>` | Clone a git repository into `./<repo-name>/` and convert it |
 | `jip run` | Run the project's main class |
 | `jip jar` | Package into `target/app.jar` |
 | `jip jar --fat` | Package into `target/app-fat.jar` (all dependencies merged) |
@@ -140,12 +140,11 @@ jip add commons-io:commons-io     # version omitted → latest from Maven Centra
 
 ### `jip get`
 
-Clones a git repository into `./<repo-name>/` (like `git clone` / `gh repo clone`) and runs it. A detected Maven/Gradle build is converted to `jip.toml` automatically — clones are throwaway, so there is **no conversion prompt**. Program arguments after `--` are passed through, and the global `--offline` flag applies:
+Clones a git repository into `./<repo-name>/` (like `git clone` / `gh repo clone`) and converts a detected Maven/Gradle build to `jip.toml`. Clones are throwaway, so there is **no conversion prompt** — but the project is deliberately **not executed**: running code you just downloaded is a trust decision you should make after inspecting it. jip stops after the conversion and prints the next step:
 
 ```bash
-jip get https://github.com/example/app.git      # clone + convert + run
-jip get example.git -- start                    # run [project] main with "start" as argv[0]
-jip get example.git --offline                   # only use cached jars
+jip get https://github.com/example/app.git   # clone + convert, then:
+# next: inspect the code first, then run it with `cd app && jip run`
 jip get https://github.com/example/app.git --branch dev
 ```
 
@@ -399,7 +398,7 @@ Every dependency lives in one of three scopes. The table shows where each scope 
 
 ## Maven & Gradle Conversion
 
-`jip init` (or the lazy conversion offer in `jip run`/`jip build`/`jip test`) detects Maven and Gradle projects and offers to convert them. `jip get` converts automatically (no prompt) after cloning, so running a foreign repository is a single command.
+`jip init` (or the lazy conversion offer in `jip run`/`jip build`/`jip test`) detects Maven and Gradle projects and offers to convert them. `jip get` converts automatically (no prompt) after cloning — it stops there and prints the `jip run` command instead of executing the freshly cloned code.
 
 ### What gets converted
 

@@ -174,23 +174,19 @@ pub enum Command {
         shell: String,
     },
 
-    /// Clone a repository and run it.
+    /// Clone a repository and prepare it for running.
     ///
-    /// Shallow-clones the given git URL into `./<repo-name>/` and then runs
-    /// the project like `jip run` would: a Maven/Gradle build is converted
-    /// to `jip.toml` automatically (non-interactive), dependencies are
-    /// lazily resolved, and the main class is picked or detected.  Arguments
-    /// after `--` are passed through to the program, e.g.
-    /// `jip get https://github.com/user/helloworld -- start`.
+    /// Shallow-clones the given git URL into `./<repo-name>/` and converts a
+    /// detected Maven/Gradle build to `jip.toml` automatically (clones are
+    /// throwaway, so there is no conversion prompt).  The project is
+    /// deliberately NOT executed — running cloned code is a trust decision —
+    /// instead jip prints the `jip run` command as the next step.
     Get {
         /// Git URL to clone, e.g. `https://github.com/user/project.git`.
         url: String,
         /// Check out this remote branch instead of the default branch.
         #[arg(long)]
         branch: Option<String>,
-        /// Arguments passed through to the program.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
     },
 
     /// Manage JDK installations.

@@ -13,11 +13,13 @@
 // =============================================================================
 //  jip — `jip get`
 //  ---------------------------------------------------------------------------
-//  Clones a git repository into `./<repo-name>/` and runs it.  A detected
-//  Maven or Gradle build is converted to `jip.toml` automatically (clones
-//  are meant to be throwaway, so there is no conversion prompt), then the
-//  project is run just like `jip run` would.  Nom-Maven / non-Gradle clones
-//  are refused and the directory is left for the user to remove.
+//  Clones a git repository into `./<repo-name>/` and converts a detected
+//  Maven or Gradle build to `jip.toml` automatically (clones are meant to
+//  be throwaway, so there is no conversion prompt).  It does NOT execute
+//  the project: running arbitrary cloned code is a trust decision, so jip
+//  stops after the conversion and prints the `jip run` command instead.
+//  Nom-Maven / non-Gradle clones are refused and the directory is left for
+//  the user to remove.
 //
 //  Project:   jip
 //  Author:    autumo GmbH
@@ -34,13 +36,12 @@ use crate::config::CONFIG_FILE;
 use crate::convert;
 use crate::lock::LOCK_FILE;
 
-/// Clone the given repository into `./<repo-name>/` and run it.
+/// Clone the given repository into `./<repo-name>/`, convert it, and print
+/// the next step.  The project is deliberately not run automatically.
 pub fn run(
     client: &reqwest::blocking::Client,
-    offline: bool,
     url: &str,
     branch: Option<&str>,
-    args: &[String],
 ) -> anyhow::Result<()> {
     let name = repo_name(url);
     let target = Path::new(&name);
@@ -68,9 +69,13 @@ pub fn run(
         git.arg("--branch").arg(branch);
     }
     git.arg(url).arg(target);
-    let status = git
-        .status()
-        .with_context(|| "failed to run `git clone` — is git installed?")?;
+    let status = match git.status() {
+        Ok(status) => status,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            bail!("`git` is not installed — `jip get` needs git to clone repositories")
+        }
+        Err(err) => return Err(err).context("failed to run `git clone`"),
+    };
     if !status.success() {
         bail!("`git clone` failed for {url}");
     }
@@ -88,8 +93,8 @@ pub fn run(
     } else {
         bail!(
             "./{name} is not a Maven or Gradle project — there is nothing to \
-             convert or run.  Remove the directory with `rm -rf {name}` if it \
-             is not needed"
+             convert.  Remove the directory with `rm -rf {name}` if it is \
+             not needed"
         );
     };
 
@@ -100,8 +105,13 @@ pub fn run(
             "converted {project_type} project — created {CONFIG_FILE} and {LOCK_FILE}"
         ))
     );
-
-    crate::commands::run::run(client, offline, None, &[], args)
+    println!(
+        "{}",
+        crate::console::green(&format!(
+            "next: inspect the code first, then run it with `cd {name} && jip run`"
+        ))
+    );
+    Ok(())
 }
 
 /// Derive the local directory name from a git URL, like `git clone` does.

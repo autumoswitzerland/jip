@@ -136,12 +136,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Gradle subprojects included dynamically at run time (no static `include`
     statements) warn that jip cannot detect them and converted the project
     as a single module.
-- `jip get <url>` — clone a git repository into `./<repo-name>/` and run it
-  in one step. Shallow clones by default (`--depth 1`), checks the directory
-  name first (TTY prompt) like `git clone`, converts a detected Maven/Gradle
-  build to `jip.toml` automatically (no prompt, since clones are throwaway),
-  passes arguments after `--` to the program, and honours the global
-  `--offline` flag. Repositories without a Maven/Gradle build are refused
-  with a clear error and the cloned directory is left in place.
+- `jip get <url>` — clone a git repository into `./<repo-name>/` and convert
+  it in one step. Shallow clones by default (`--depth 1`), checks the
+  directory name first (TTY prompt) like `git clone`, and converts a detected
+  Maven/Gradle build to `jip.toml` automatically (no prompt, since clones are
+  throwaway). The project is deliberately NOT executed after the conversion —
+  running freshly downloaded code is a trust decision — jip prints the next
+  step (`cd <repo-name> && jip run`) instead. Repositories without a
+  Maven/Gradle build are refused with a clear error and the cloned directory
+  is left in place.
 
 [1.0.0]: https://github.com/autumoswitzerland/jip/releases/tag/v1.0.0
