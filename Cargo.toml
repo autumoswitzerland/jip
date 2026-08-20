@@ -10,6 +10,7 @@ homepage = "https://github.com/autumoswitzerland/jip"
 authors = ["autumo GmbH"]
 keywords = ["java", "dependency-manager", "maven", "gradle", "build-tool"]
 categories = ["command-line-utilities", "development-tools"]
+exclude = ["AGENTS.md", ".github/", "bin/", "logo.png"]
 
 [dependencies]
 anyhow = "1"
