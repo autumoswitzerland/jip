@@ -2002,7 +2002,11 @@ mod tests {
         "#;
         let repos = gradle_repositories_from_content(script);
         assert_eq!(repos.len(), 1);
-        let url = &repos["/Users/Mike/Development/OpenCode/jip/lib/repo"];
+        let expected = format!(
+            "{}/lib/repo",
+            std::env::current_dir().unwrap().to_string_lossy()
+        );
+        let url = &repos[&expected];
         assert!(url.starts_with("/"));
         assert!(url.ends_with("/lib/repo"));
     }

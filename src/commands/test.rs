@@ -149,32 +149,25 @@ mod tests {
 
     #[test]
     fn recognises_console_standalone_jar() {
-        let standalone = Path::new(
-            "/tmp/jip-cache/org.junit.platform/junit-platform-console-standalone-1.11.0.jar",
-        );
+        let standalone = Path::new("junit-platform-console-standalone-1.11.0.jar");
         assert!(is_console_standalone(standalone));
         assert!(!is_console_standalone(Path::new(
-            "/tmp/jip-cache/junit-jupiter-api-5.11.0.jar"
+            "junit-jupiter-api-5.11.0.jar"
         )));
         assert!(!is_console_standalone(Path::new(
-            "/tmp/jip-cache/junit-platform-console-1.11.0.jar"
+            "junit-platform-console-1.11.0.jar"
         )));
     }
 
     #[test]
     fn extracts_platform_version_from_jar_name() {
         assert_eq!(
-            standalone_version(Path::new(
-                "/tmp/jip-cache/junit-platform-console-standalone-6.1.3.jar"
-            ))
-            .as_deref(),
+            standalone_version(Path::new("junit-platform-console-standalone-6.1.3.jar")).as_deref(),
             Some("6.1.3")
         );
         assert_eq!(
-            standalone_version(Path::new(
-                "/tmp/jip-cache/junit-platform-console-standalone-1.13.0-M3.jar"
-            ))
-            .as_deref(),
+            standalone_version(Path::new("junit-platform-console-standalone-1.13.0-M3.jar"))
+                .as_deref(),
             Some("1.13.0-M3")
         );
         assert_eq!(standalone_version(Path::new("guava.jar")), None);
