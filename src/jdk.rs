@@ -27,6 +27,7 @@
 //  Date:      2026-08-18
 // =============================================================================
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -128,8 +129,29 @@ fn detect_arch() -> &'static str {
     }
 }
 
+/// The optional per-vendor download URL override from `~/.jip/jdk.toml`
+/// (`[vendors]` section), with the `{version}`, `{arch}` and `{os}`
+/// placeholders substituted.
+///
+/// Returns `None` when the vendor has no override, so the built-in URL
+/// patterns apply.  A broken config file is ignored (the override is a
+/// convenience, not a requirement).
+pub fn custom_download_url(vendor: Vendor, version: &str) -> Option<String> {
+    let config = ActiveConfig::load().ok()?;
+    let template = config.vendors.get(&vendor.to_string())?;
+    Some(
+        template
+            .replace("{version}", version)
+            .replace("{arch}", detect_arch())
+            .replace("{os}", detect_os()),
+    )
+}
+
 /// Build the download URL for a given vendor and version.
 pub fn download_url(client: &Client, vendor: Vendor, version: &str) -> anyhow::Result<String> {
+    if let Some(url) = custom_download_url(vendor, version) {
+        return Ok(url);
+    }
     let os = detect_os();
     let arch = detect_arch();
     match vendor {
@@ -294,6 +316,11 @@ fn resolve_graalvm_url(
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ActiveConfig {
     pub active: Option<ActiveEntry>,
+    /// Optional per-vendor download URL templates that override the built-in
+    /// patterns.  The `{version}`, `{arch}` and `{os}` placeholders are
+    /// substituted when installing.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub vendors: BTreeMap<String, String>,
 }
 
 /// An entry in the `[active]` section of `jdk.toml`.
@@ -668,19 +695,30 @@ mod tests {
                 vendor: Vendor::Temurin,
                 version: "21".to_string(),
             }),
+            vendors: BTreeMap::new(),
         };
         config.save().unwrap();
         let loaded = ActiveConfig::load().unwrap();
         let active = loaded.active.unwrap();
         assert_eq!(active.vendor, Vendor::Temurin);
         assert_eq!(active.version, "21");
-        ActiveConfig { active: None }.save().unwrap();
+        ActiveConfig {
+            active: None,
+            vendors: BTreeMap::new(),
+        }
+        .save()
+        .unwrap();
     }
 
     #[test]
     fn active_java_fails_when_no_active() {
         let _lock = ACTIVE_MUTEX.lock().unwrap();
-        ActiveConfig { active: None }.save().unwrap();
+        ActiveConfig {
+            active: None,
+            vendors: BTreeMap::new(),
+        }
+        .save()
+        .unwrap();
         let result = active_java();
         assert!(result.is_err());
         assert!(
@@ -699,12 +737,18 @@ mod tests {
                 vendor: Vendor::Zulu,
                 version: "999".to_string(),
             }),
+            vendors: BTreeMap::new(),
         };
         config.save().unwrap();
         let result = active_java();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
-        ActiveConfig { active: None }.save().unwrap();
+        ActiveConfig {
+            active: None,
+            vendors: BTreeMap::new(),
+        }
+        .save()
+        .unwrap();
     }
 
     #[test]
@@ -722,6 +766,7 @@ mod tests {
                 vendor: Vendor::Zulu,
                 version: "21".to_string(),
             }),
+            vendors: BTreeMap::new(),
         };
         config.save().unwrap();
 
@@ -730,6 +775,103 @@ mod tests {
         assert!(path.to_string_lossy().contains("zulu/21/bin/java"));
 
         let _ = fs::remove_dir_all(base.join("zulu").join("21"));
-        ActiveConfig { active: None }.save().unwrap();
+        ActiveConfig {
+            active: None,
+            vendors: BTreeMap::new(),
+        }
+        .save()
+        .unwrap();
+    }
+
+    #[test]
+    fn custom_download_url_substitutes_placeholders() {
+        let _lock = ACTIVE_MUTEX.lock().unwrap();
+        let config = ActiveConfig {
+            active: None,
+            vendors: BTreeMap::from([(
+                "corretto".to_string(),
+                "https://mirror.example/jdk-{os}-{arch}.tar.gz".to_string(),
+            )]),
+        };
+        config.save().unwrap();
+
+        let url = custom_download_url(Vendor::Corretto, "21").unwrap();
+        assert_eq!(
+            url,
+            format!(
+                "https://mirror.example/jdk-{}-{}.tar.gz",
+                detect_os(),
+                detect_arch()
+            )
+        );
+
+        // Without an override the lookup falls back to None.
+        assert!(custom_download_url(Vendor::Zulu, "21").is_none());
+        ActiveConfig {
+            active: None,
+            vendors: BTreeMap::new(),
+        }
+        .save()
+        .unwrap();
+    }
+
+    #[test]
+    fn download_url_prefers_custom_override() {
+        let _lock = ACTIVE_MUTEX.lock().unwrap();
+        let config = ActiveConfig {
+            active: None,
+            vendors: BTreeMap::from([(
+                "corretto".to_string(),
+                "https://only-here.example/{version}".to_string(),
+            )]),
+        };
+        config.save().unwrap();
+
+        let client = reqwest::blocking::Client::new();
+        let url = download_url(&client, Vendor::Corretto, "21").unwrap();
+        assert_eq!(url, "https://only-here.example/21");
+        ActiveConfig {
+            active: None,
+            vendors: BTreeMap::new(),
+        }
+        .save()
+        .unwrap();
+    }
+
+    #[test]
+    fn vendors_roundtrip_survives_save() {
+        let _lock = ACTIVE_MUTEX.lock().unwrap();
+        let config = ActiveConfig {
+            active: Some(ActiveEntry {
+                vendor: Vendor::Zulu,
+                version: "21".to_string(),
+            }),
+            vendors: BTreeMap::from([(
+                "zulu".to_string(),
+                "https://custom.example/{version}".to_string(),
+            )]),
+        };
+        config.save().unwrap();
+
+        // A later update of the active JDK re-saves the loaded config —
+        // the [vendors] section must survive.
+        let mut loaded = ActiveConfig::load().unwrap();
+        loaded.active = Some(ActiveEntry {
+            vendor: Vendor::Temurin,
+            version: "17".to_string(),
+        });
+        loaded.save().unwrap();
+
+        let reloaded = ActiveConfig::load().unwrap();
+        assert_eq!(
+            reloaded.vendors.get("zulu").map(String::as_str),
+            Some("https://custom.example/{version}")
+        );
+        ActiveConfig {
+            active: None,
+            vendors: BTreeMap::new(),
+        }
+        .save()
+        .unwrap();
     }
 }

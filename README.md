@@ -297,6 +297,28 @@ Supported vendors: `zulu` (Azul Zulu, default), `temurin` (Eclipse Temurin), `co
 
 JDKs are stored in `~/.jip/jdks/{vendor}/{version}/`. The active JDK is tracked in `~/.jip/jdk.toml`.
 
+The download URLs of the built-in vendors can be overridden in `~/.jip/jdk.toml` if a vendor changes its layout and no jip release is out yet. The current built-in patterns double as ready-made templates:
+
+```toml
+# All entries are optional; vendors without an override keep the built-in
+# patterns.  {version} is the requested version, {arch} is `x64` or `aarch64`,
+# {os} is `macos`, `linux` or `windows`.
+[vendors]
+
+# Azul Zulu is resolved via the metadata API (current URL below), which
+# returns JSON containing `download_url` — not a direct archive link:
+#   https://api.azul.com/metadata/v1/zulu/packages/?java_version={version}&os={os}&arch={arch}&archive_type=tar.gz&java_package_type=jdk&latest=true&release_status=ga
+# An override must point to a static tarball pattern, e.g. a mirror:
+zulu = "https://cdn.example/zulu-jdk-{version}-{os}-{arch}.tar.gz"
+
+# Eclipse Temurin — the API expects `mac` for macOS (jip's {os} is `macos`),
+# so the literal `mac` is used here:
+temurin = "https://api.adoptium.net/v3/binary/latest/{version}/ga/mac/{arch}/jdk/hotspot/normal/eclipse"
+
+corretto = "https://corretto.aws/downloads/latest/amazon-corretto-{version}-{arch}-{os}-jdk.tar.gz"
+graalvm = "https://github.com/graalvm/graalvm-ce-builds/releases/download/jdk-{version}/graalvm-jdk-{version}_{os}-{arch}.tar.gz"
+```
+
 When the active JDK is removed and other JDKs are still installed, `jip` requires switching to another version first. When the last JDK is removed, the active config is cleared and `jip build`/`run`/`test` fall back to the system `java` on PATH.
 
 When a project needs a newer Java than the active JDK but a matching JDK is already installed, `jip build`/`run`/`test` tell you ("this project needs Java X") and ask whether to switch (`use zulu 19 as active JDK? [Y/n]`) — the JDK is never activated without an explicit answer, and without a terminal it lists the candidates instead.

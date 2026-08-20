@@ -71,6 +71,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Supported vendors: `zulu` (default), `temurin`, `corretto`, `graalvm`.
 - `jip java remove` clears the active JDK config when the last installed
   JDK is removed, falling back to the system `java` on PATH.
+- Optional per-vendor download URL overrides in `~/.jip/jdk.toml`
+  (`[vendors]`): each built-in vendor can get a custom URL template with
+  `{version}`, `{arch}` and `{os}` placeholders that replaces the built-in
+  pattern (useful when a vendor changes its download layout before a jip
+  release exists). Vendors without an override keep the built-in URLs.
 - BOM / dependency-management import during conversion:
   - Maven `<dependencyManagement>` imports (`<type>pom</type><scope>import</scope>`)
     are downloaded and their managed versions applied to version-less
