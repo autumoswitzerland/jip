@@ -76,6 +76,9 @@ fn run(offline: bool, command: Command) -> anyhow::Result<()> {
             args,
         } => commands::run::run(&client, offline, main.as_deref(), &defines, &args),
         Command::Jar { fat } => commands::jar::run(&client, offline, fat),
+        Command::Get { url, branch, args } => {
+            commands::get::run(&client, offline, &url, branch.as_deref(), &args)
+        }
         Command::Test => commands::test::run(&client, offline),
         Command::Search { query } => commands::search::run(&client, &query),
         Command::Tree => commands::tree::run(&client, offline),

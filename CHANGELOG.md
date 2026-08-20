@@ -117,6 +117,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     directory does not exist on disk.
   - Missing Java versions now explain the BOM-flattening limitation and
     what to do (`jip java install`, `dependencyManagement`).
+  - The multi-module build order is deterministic: modules at the same
+    dependency level are built in alphabetical order instead of a
+    hash-map-dependent order that changed between runs.
 - JDK selection: when the project needs a newer Java than the active JDK
   but a matching JDK is already installed, `jip run`/`jip build` tell the
   user ("this project needs Java X") and ask (TTY only) whether to switch
@@ -133,5 +136,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Gradle subprojects included dynamically at run time (no static `include`
     statements) warn that jip cannot detect them and converted the project
     as a single module.
+- `jip get <url>` — clone a git repository into `./<repo-name>/` and run it
+  in one step. Shallow clones by default (`--depth 1`), checks the directory
+  name first (TTY prompt) like `git clone`, converts a detected Maven/Gradle
+  build to `jip.toml` automatically (no prompt, since clones are throwaway),
+  passes arguments after `--` to the program, and honours the global
+  `--offline` flag. Repositories without a Maven/Gradle build are refused
+  with a clear error and the cloned directory is left in place.
 
 [1.0.0]: https://github.com/autumoswitzerland/jip/releases/tag/v1.0.0

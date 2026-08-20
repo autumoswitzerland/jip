@@ -28,7 +28,7 @@
 //  Date:      2026-08-19
 // =============================================================================
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -433,10 +433,12 @@ fn collect_gradle_inter_module_deps(module_name: &str) -> Vec<String> {
 /// Topological sort of modules based on their inter-module dependencies.
 ///
 /// Returns modules in build order (dependencies first).  Returns an error
-/// when a cycle is detected.
+/// when a cycle is detected.  The result is deterministic: the seed queue
+/// and every dependency list are walked in sorted order, so the same project
+/// always produces the same build order.
 pub fn topological_sort(modules: &[ModuleInfo]) -> anyhow::Result<Vec<ModuleInfo>> {
-    let mut in_degree: HashMap<String, usize> = HashMap::new();
-    let mut dependents: HashMap<String, Vec<String>> = HashMap::new();
+    let mut in_degree: BTreeMap<String, usize> = BTreeMap::new();
+    let mut dependents: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
     for m in modules {
         in_degree.entry(m.name.clone()).or_insert(0);
@@ -661,15 +663,9 @@ mod tests {
         ];
         let sorted = topological_sort(&modules).unwrap();
         let names: Vec<&str> = sorted.iter().map(|m| m.name.as_str()).collect();
-        // base must come before left and right; left and right before root.
-        let base_pos = names.iter().position(|&n| n == "base").unwrap();
-        let left_pos = names.iter().position(|&n| n == "left").unwrap();
-        let right_pos = names.iter().position(|&n| n == "right").unwrap();
-        let root_pos = names.iter().position(|&n| n == "root").unwrap();
-        assert!(base_pos < left_pos);
-        assert!(base_pos < right_pos);
-        assert!(left_pos < root_pos);
-        assert!(right_pos < root_pos);
+        // Deterministic: base first, then left and right sorted by name,
+        // and root last.
+        assert_eq!(names, vec!["base", "left", "right", "root"]);
     }
 
     #[test]
