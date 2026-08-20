@@ -96,11 +96,21 @@ pub fn run(
             }
             target
         }
-        MainDecision::None => bail!(
-            "no main class found — write a class with `public static void main` \
-             under {} or set [project] main in jip.toml",
-            build::source_dir(&config).display()
-        ),
+        MainDecision::None => {
+            if build::has_kotlin_sources(&config) {
+                bail!(
+                    "no main class found — only Java classes are scanned \
+                     (Kotlin sources are not supported); write a Java class with \
+                     `public static void main` under {} or set [project] main in jip.toml",
+                    build::source_dir(&config).display()
+                );
+            }
+            bail!(
+                "no main class found — write a class with `public static void main` \
+                 under {} or set [project] main in jip.toml",
+                build::source_dir(&config).display()
+            )
+        }
     };
 
     run_target(
@@ -129,6 +139,9 @@ fn run_multi_module(
 
     let root_dir = std::env::current_dir()?;
     check_java_version(config.project.java.as_deref())?;
+
+    // Lazily compile every module in dependency order (no-op when up to date).
+    build::run_multi_module(client, config, offline)?;
 
     // Build the classpath: all module target/classes + all external deps.
     // Sort modules so we build the classpath in dependency order.
@@ -199,6 +212,25 @@ fn run_multi_module(
             if let Some(fqcn) = all_candidates.into_iter().next() {
                 MainTarget::Class(fqcn)
             } else {
+                let mut kotlin = false;
+                for module in &sorted {
+                    let module_config = crate::multi::load_module_config(&root_dir, &module.path)?;
+                    let original_dir = std::env::current_dir()?;
+                    std::env::set_current_dir(root_dir.join(&module.path))?;
+                    let has_kt = build::has_kotlin_sources(&module_config);
+                    std::env::set_current_dir(&original_dir)?;
+                    if has_kt {
+                        kotlin = true;
+                        break;
+                    }
+                }
+                if kotlin {
+                    bail!(
+                        "no main class found — only Java classes are scanned \
+                         (Kotlin sources are not supported); write a Java class with \
+                         `public static void main` in any module or set [project] main in jip.toml"
+                    );
+                }
                 bail!(
                     "no main class found — write a class with `public static void main` \
                      in any module or set [project] main in jip.toml"

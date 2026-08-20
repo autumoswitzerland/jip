@@ -119,6 +119,26 @@ pub(crate) fn run_multi_module(
         let original_dir = std::env::current_dir()?;
         std::env::set_current_dir(root_dir.join(&module.path))?;
 
+        // Aggregator/BOM/parent modules legitimately have no sources — skip
+        // them instead of failing the whole build.
+        if !has_sources(&module_config) {
+            let reason = if has_kotlin_sources(&module_config) {
+                " (Kotlin sources are not supported — jip compiles Java only)"
+            } else {
+                ""
+            };
+            println!(
+                "{}",
+                crate::console::yellow(&format!(
+                    "skipping module '{}' — no .java sources under {}{reason}",
+                    module.name,
+                    source_dir(&module_config).display()
+                ))
+            );
+            std::env::set_current_dir(&original_dir)?;
+            continue;
+        }
+
         // Build the classpath: external deps + inter-module target/classes.
         let external_classpath = compile_classpath_for(client, &module_config, offline)?;
         let full_classpath =
@@ -145,6 +165,14 @@ pub fn compile(config: &ProjectConfig, classpath: &[PathBuf]) -> anyhow::Result<
     let source_dir = source_dir(config);
     let sources = collect_java_files(&source_dir);
     if sources.is_empty() {
+        if has_kotlin_sources(config) {
+            bail!(
+                "no .java files found in {} — jip compiles Java only; \
+                 Kotlin sources under {} are not supported",
+                source_dir.display(),
+                source_dir.with_file_name("kotlin").display()
+            );
+        }
         bail!(
             "no .java files found in {} — put your sources there",
             source_dir.display()
@@ -208,6 +236,26 @@ pub fn source_dir(config: &ProjectConfig) -> PathBuf {
         .as_deref()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_SOURCE_DIR))
+}
+
+/// Whether the project has any `.java` sources under its source directory.
+/// Aggregator/BOM/parent modules without sources return `false`.
+pub fn has_sources(config: &ProjectConfig) -> bool {
+    !collect_java_files(&source_dir(config)).is_empty()
+}
+
+/// Whether the project has sources under `src/main/kotlin` (unsupported by
+/// jip, which compiles only Java sources).
+pub fn has_kotlin_sources(config: &ProjectConfig) -> bool {
+    let kotlin_dir = source_dir(config).with_file_name("kotlin");
+    if !kotlin_dir.is_dir() {
+        return false;
+    }
+    let mut files = Vec::new();
+    walk(&kotlin_dir, &mut files);
+    files
+        .iter()
+        .any(|p| p.extension().is_some_and(|e| e == "kt"))
 }
 
 /// Decide what `jip run` starts.  Explicit arguments and `[project] main`

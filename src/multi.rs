@@ -108,6 +108,116 @@ fn detect_maven_multi_module() -> Option<MultiModuleLayout> {
     })
 }
 
+/// A hint when a Gradle project could not be detected as multi-module even
+/// though it contains subprojects (modules included dynamically at run time,
+/// e.g. via a directory walk).  Returns `None` when the layout is fine.
+pub fn undetected_gradle_multi_module_hint() -> Option<String> {
+    let has_settings =
+        Path::new("settings.gradle").exists() || Path::new("settings.gradle.kts").exists();
+    if !has_settings {
+        return None;
+    }
+
+    // Subproject directories: contain a build.gradle(.kts) but no own
+    // settings file (which would make them independent projects).
+    let subprojects = root_subprojects();
+    if subprojects.len() < 2 {
+        return None;
+    }
+
+    Some(format!(
+        "found {} Gradle subprojects under this directory, but they are not \
+         listed as static `include` statements in settings.gradle — they are \
+         likely included dynamically at run time; jip cannot detect such module \
+         structures and converted the project as a single module",
+        subprojects.len()
+    ))
+}
+
+/// Directories below the root (max depth 2) that carry a `build.gradle` or
+/// `build.gradle.kts` but no own settings file.
+fn root_subprojects() -> Vec<String> {
+    let mut found = Vec::new();
+    let mut stack: Vec<PathBuf> = vec![PathBuf::from(".")];
+    while let Some(dir) = stack.pop() {
+        if dir == Path::new(".") {
+            if let Ok(entries) = fs::read_dir(".") {
+                for entry in entries.flatten() {
+                    if entry.path().is_dir() {
+                        stack.push(entry.path());
+                    }
+                }
+            }
+            continue;
+        }
+        let has_build = dir.join("build.gradle").exists() || dir.join("build.gradle.kts").exists();
+        let is_independent =
+            dir.join("settings.gradle").exists() || dir.join("settings.gradle.kts").exists();
+        if has_build && !is_independent {
+            found.push(dir.display().to_string());
+        }
+        // Only recurse one level deeper (max depth 2).
+        if dir.components().count() < 2
+            && let Ok(entries) = fs::read_dir(&dir)
+        {
+            for entry in entries.flatten() {
+                if entry.path().is_dir() {
+                    stack.push(entry.path());
+                }
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// A hint when a Maven project could not be detected as multi-module even
+/// though it looks like an aggregator/parent POM (modules in a profile, or a
+/// nested aggregator).  Returns `None` when the layout is fine as-is.
+pub fn undetected_multi_module_hint() -> Option<String> {
+    let xml = fs::read_to_string("pom.xml").ok()?;
+    let doc = roxmltree::Document::parse(&xml).ok()?;
+    let project = doc.root_element();
+
+    // A parent POM is packaging=pom without sources — only meaningful as an
+    // aggregator; if we failed to detect its modules, say so.
+    let packaging = project
+        .children()
+        .find(|n| n.is_element() && n.tag_name().name() == "packaging")
+        .and_then(|n| n.text())
+        .unwrap_or("jar");
+    if packaging != "pom" {
+        return None;
+    }
+
+    let has_direct_modules = project
+        .children()
+        .any(|n| n.is_element() && n.tag_name().name() == "modules");
+
+    let modules_in_profile = project.descendants().any(|n| {
+        n.is_element()
+            && n.tag_name().name() == "modules"
+            && n.ancestors().any(|a| a.tag_name().name() == "profile")
+    });
+
+    if modules_in_profile {
+        return Some(
+            "this is a Maven parent POM with <modules> declared inside a <profile> — \
+             jip cannot detect such module structures; the project was converted as a single module"
+                .to_string(),
+        );
+    }
+    if !has_direct_modules {
+        return Some(
+            "this is a Maven parent POM (packaging=pom) without direct <modules> — \
+             the aggregator may be nested deeper; jip cannot detect such module structures and \
+             converted the project as a single module"
+                .to_string(),
+        );
+    }
+    None
+}
+
 /// Extract `<modules>` from a parsed POM, resolving inter-module dependencies.
 fn parse_maven_modules(parent_pom: &Pom) -> Option<Vec<ModuleInfo>> {
     // We need to find <modules> in the XML — but our Pom struct doesn't
@@ -127,6 +237,11 @@ fn parse_maven_modules(parent_pom: &Pom) -> Option<Vec<ModuleInfo>> {
         .children()
         .filter(|n| n.is_element() && n.tag_name().name() == "module")
         .filter_map(|n| n.text().map(str::trim).map(str::to_string))
+        .collect();
+
+    let module_names: Vec<String> = module_names
+        .into_iter()
+        .filter(|name| Path::new(name).is_dir())
         .collect();
 
     if module_names.len() < 2 {
@@ -226,11 +341,15 @@ fn detect_gradle_multi_module() -> Option<MultiModuleLayout> {
     };
 
     let module_names = parse_gradle_modules(&content);
-    if module_names.len() < 2 {
+    let existing: Vec<String> = module_names
+        .into_iter()
+        .filter(|name| Path::new(name).is_dir())
+        .collect();
+    if existing.len() < 2 {
         return None;
     }
 
-    let modules = module_names
+    let modules = existing
         .into_iter()
         .map(|name| {
             let depends_on = collect_gradle_inter_module_deps(&name);

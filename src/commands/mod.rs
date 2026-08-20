@@ -40,6 +40,7 @@ pub mod test;
 pub mod tree;
 pub mod update;
 
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -305,6 +306,10 @@ pub fn classpath_separator() -> &'static str {
 }
 
 /// Check that the installed JDK is new enough for the project.
+///
+/// When the active JDK is too old but a matching JDK is already installed,
+/// the user is asked (TTY only) whether to switch to it.  The JDK is never
+/// activated without an explicit answer.
 pub fn check_java_version(required: Option<&str>) -> anyhow::Result<()> {
     let Some(required) = required else {
         return Ok(());
@@ -312,13 +317,102 @@ pub fn check_java_version(required: Option<&str>) -> anyhow::Result<()> {
     let required_major = parse_major(required)
         .with_context(|| format!("invalid java version \"{required}\" in jip.toml"))?;
     let installed_major = java_major_version()?;
-    if installed_major < required_major {
+    if installed_major >= required_major {
+        return Ok(());
+    }
+
+    // Find installed JDKs that satisfy the requirement.
+    let candidates: Vec<crate::jdk::JdkInstallation> = crate::jdk::list_installed()?
+        .into_iter()
+        .filter(|j| parse_major(&j.version).unwrap_or(0) >= required_major)
+        .collect();
+
+    if candidates.is_empty() {
         bail!(
-            "this project needs Java {required}, but the installed JDK is Java {installed_major} \
-             (install a newer JDK and try again, e.g. `jip java install {required}`)"
+            "this project needs Java {required_major}, but the installed JDK is Java {installed_major} \
+             (install a newer JDK and try again, e.g. `jip java install {required_major}`)"
         );
     }
+
+    println!(
+        "{}",
+        crate::console::yellow(&format!(
+            "this project needs Java {required_major}, but the active JDK is Java {installed_major}"
+        ))
+    );
+
+    if !std::io::stdin().is_terminal() {
+        let listed: Vec<String> = candidates
+            .iter()
+            .map(|j| format!("  - {} {}", j.vendor, j.version))
+            .collect();
+        bail!(
+            "no active JDK matches — set one with `jip java use <version>`:\n{}",
+            listed.join("\n")
+        );
+    }
+
+    let chosen = pick_jdk(&candidates)?;
+    crate::jdk::set_active(chosen.vendor, &chosen.version)?;
     Ok(())
+}
+
+/// Let the user pick one of several matching installed JDKs (numbered), or
+/// confirm the only candidate with a yes/no prompt.
+fn pick_jdk(
+    candidates: &[crate::jdk::JdkInstallation],
+) -> anyhow::Result<crate::jdk::JdkInstallation> {
+    if candidates.len() == 1 {
+        let j = &candidates[0];
+        print!(
+            "use {} {} as active JDK? [Y/n] ",
+            crate::console::bold(&j.vendor.to_string()),
+            crate::console::bold(&j.version)
+        );
+        std::io::stdout().flush().context("cannot write prompt")?;
+        let mut answer = String::new();
+        std::io::stdin()
+            .read_line(&mut answer)
+            .context("cannot read answer")?;
+        let answer = answer.trim();
+        if answer.is_empty()
+            || answer.eq_ignore_ascii_case("y")
+            || answer.eq_ignore_ascii_case("yes")
+        {
+            return Ok(j.clone());
+        }
+        bail!("aborted — set a JDK with `jip java use <version>`");
+    }
+
+    println!(
+        "installed JDKs matching Java {}:",
+        parse_major(&candidates[0].version).unwrap_or(0)
+    );
+    for (index, j) in candidates.iter().enumerate() {
+        println!("  {}. {} {}", index + 1, j.vendor, j.version);
+    }
+    let stdin = std::io::stdin();
+    loop {
+        print!("  select 1-{} (q to quit): ", candidates.len());
+        std::io::stdout().flush().context("cannot write prompt")?;
+        let mut answer = String::new();
+        if stdin
+            .read_line(&mut answer)
+            .context("cannot read selection")?
+            == 0
+        {
+            bail!("aborted");
+        }
+        let answer = answer.trim();
+        if answer.eq_ignore_ascii_case("q") || answer.is_empty() {
+            bail!("aborted — set a JDK with `jip java use <version>`");
+        }
+        if let Ok(index) = answer.parse::<usize>()
+            && let Some(j) = candidates.get(index.wrapping_sub(1))
+        {
+            return Ok(j.clone());
+        }
+    }
 }
 
 /// Query the major Java version — uses the active JDK if set, otherwise `java` from PATH.

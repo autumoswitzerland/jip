@@ -257,7 +257,9 @@ impl Resolver {
             if version.is_empty() || version.contains("${") {
                 bail!(
                     "no version for \"{group}:{name}\" declared by {artifact} \
-                     (set one explicitly or via dependencyManagement)"
+                     (this version is usually managed by a BOM/platform that a transitive \
+                     dependency imports — jip resolves only top-level BOMs at conversion time, \
+                     so set the version explicitly or add it via dependencyManagement)"
                 );
             }
 

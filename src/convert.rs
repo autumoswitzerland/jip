@@ -650,6 +650,10 @@ pub fn gradle_dependencies(
             match resolve_catalog_accessor(&catalog, alias) {
                 Some(dep) if is_test => test.push(dep),
                 Some(dep) => runtime.push(dep),
+                None if alias.starts_with("bundles.") => println!(
+                    "  {} version catalog bundle libs.{alias} not resolved — add each library from the bundle manually",
+                    crate::console::yellow("warning:")
+                ),
                 None => println!(
                     "  {} version catalog accessor libs.{alias} not found — skipped",
                     crate::console::yellow("warning:")
@@ -1139,6 +1143,15 @@ pub fn convert_project(client: &reqwest::blocking::Client) -> anyhow::Result<Pro
     // Check for multi-module project first.
     if let Some(layout) = crate::multi::detect_multi_module() {
         return convert_multi_module(client, &layout);
+    }
+
+    // A parent POM / dynamic-include Gradle layout that jip could not detect
+    // as multi-module is not supported — tell the user why building the
+    // converted single module will find no sources.
+    if let Some(hint) = crate::multi::undetected_multi_module_hint()
+        .or_else(crate::multi::undetected_gradle_multi_module_hint)
+    {
+        println!("  {} {hint}", crate::console::yellow("warning:"));
     }
 
     convert_single_module(client)
