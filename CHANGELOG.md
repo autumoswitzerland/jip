@@ -107,5 +107,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   download BOM/platform POMs during conversion.
 - Maven `PomDependency` carries an optional `typ` field (`<type>` element)
   to detect BOM imports (`type=pom`).
+- Multi-module robustness:
+  - `jip run` now lazily compiles every module in dependency order before
+    starting, like `jip build` does (no more `ClassNotFoundException` on a
+    fresh clone).
+  - `jip build` / `jip jar` skip modules without `.java` sources
+    (aggregator/BOM/parent modules) instead of failing.
+  - Multi-module detection ignores `include`/`<module>` entries whose
+    directory does not exist on disk.
+  - Missing Java versions now explain the BOM-flattening limitation and
+    what to do (`jip java install`, `dependencyManagement`).
+- JDK selection: when the project needs a newer Java than the active JDK
+  but a matching JDK is already installed, `jip run`/`jip build` tell the
+  user ("this project needs Java X") and ask (TTY only) whether to switch
+  (`use zulu 19 as active JDK? [Y/n]`). The JDK is never activated without
+  an explicit answer.
+- Clear messages for unsupported cases:
+  - Kotlin sources (`src/main/kotlin`) are reported as not supported when
+    no Java sources or main class are found.
+  - Gradle version catalog bundles (`libs.bundles.*`) warn that the bundle
+    is not resolved and the libraries must be added manually.
+  - A Maven parent POM (`packaging=pom`) without a detectable module
+    structure (modules in a profile or nested aggregator) warns that the
+    project was converted as a single module and why.
+  - Gradle subprojects included dynamically at run time (no static `include`
+    statements) warn that jip cannot detect them and converted the project
+    as a single module.
 
 [1.0.0]: https://github.com/autumoswitzerland/jip/releases/tag/v1.0.0

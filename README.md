@@ -41,7 +41,7 @@
 - **Gradle version catalogs** — `gradle/libs.versions.toml` `[libraries]` + `[versions]` are resolved automatically
 - **JDK management** — `jip java install/use/list/remove` manages JDK installations from multiple vendors
 - **Offline mode** — `--offline` flag uses only locally cached jars, no network access
-- **Multi-module projects** — Maven multi-module and Gradle multi-project builds are detected automatically; `jip init` creates a root config with `[modules]` and per-module `jip.toml` files; `jip build` compiles modules in dependency order; `jip run` flattens all module classes onto the classpath; `jip jar` / `jip jar --fat` merge all module classes (and dependencies) into a single jar
+- **Multi-module projects** — Maven multi-module and Gradle multi-project builds are detected automatically; `jip init` creates a root config with `[modules]` and per-module `jip.toml` files; `jip build` compiles modules in dependency order; `jip run` compiles lazily and flattens all module classes onto the classpath; `jip jar` / `jip jar --fat` merge all module classes (and dependencies) into a single jar
 - **Proxy support** — HTTP/HTTPS proxy via `[proxy]` in `jip.toml` or `HTTP_PROXY`/`HTTPS_PROXY` env vars
 
 ## Quick Start
@@ -111,7 +111,11 @@ For **multi-module projects**, `jip init` detects the module structure (parent `
 - A **root `jip.toml`** with a `[modules]` section listing each module and its path
 - A **per-module `jip.toml`** in each module directory with its own dependencies
 
-Modules are built in dependency order (`jip build`) and their classes are flattened onto the classpath at runtime (`jip run`). Inter-module dependencies (e.g. `project(':base')` in Gradle or sibling artifacts in Maven) are resolved from compiled classes, not external repositories.
+Modules are built in dependency order (`jip build`) and their classes are flattened onto the classpath at runtime (`jip run`, which also compiles any module that is not up to date). Modules without Java sources (parent/BOM/aggregator modules) are skipped with a note. Inter-module dependencies (e.g. `project(':base')` in Gradle or sibling artifacts in Maven) are resolved from compiled classes, not external repositories.
+
+Layouts jip cannot handle are reported instead of silently failing:
+- Kotlin sources (`src/main/kotlin`) are not supported (Java only).
+- Gradle subprojects included dynamically at run time, and Maven parent POMs without a detectable module structure (modules in a profile or nested aggregator), are converted as a single module with a warning.
 
 Original build files are never modified.
 
@@ -272,6 +276,8 @@ Supported vendors: `zulu` (Azul Zulu, default), `temurin` (Eclipse Temurin), `co
 JDKs are stored in `~/.jip/jdks/{vendor}/{version}/`. The active JDK is tracked in `~/.jip/jdk.toml`.
 
 When the active JDK is removed and other JDKs are still installed, `jip` requires switching to another version first. When the last JDK is removed, the active config is cleared and `jip build`/`run`/`test` fall back to the system `java` on PATH.
+
+When a project needs a newer Java than the active JDK but a matching JDK is already installed, `jip build`/`run`/`test` tell you ("this project needs Java X") and ask whether to switch (`use zulu 19 as active JDK? [Y/n]`) — the JDK is never activated without an explicit answer, and without a terminal it lists the candidates instead.
 
 ## Configuration
 
