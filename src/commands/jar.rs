@@ -318,11 +318,11 @@ fn write_manifest(
     options: SimpleFileOptions,
 ) -> anyhow::Result<()> {
     let mut manifest = format!(
-        "Manifest-Version: 1.0\nCreated-By: jip {}\n",
+        "Manifest-Version: 1.0\r\nCreated-By: jip {}\r\n",
         env!("CARGO_PKG_VERSION")
     );
     if let Some(main) = main_class {
-        manifest.push_str(&format!("Main-Class: {main}\n"));
+        manifest.push_str(&format!("Main-Class: {main}\r\n"));
     }
     zip.start_file("META-INF/MANIFEST.MF", options)?;
     zip.write_all(manifest.as_bytes())?;
@@ -353,7 +353,7 @@ fn add_directory_contents_tracking(
                 .strip_prefix(base)
                 .unwrap_or(&path)
                 .to_string_lossy()
-                .into_owned();
+                .replace('\\', "/");
             if !seen.insert(relative.clone()) {
                 duplicates.push(relative);
                 continue;
@@ -467,6 +467,10 @@ mod tests {
     use super::*;
     use zip::ZipArchive;
 
+    fn test_tmp(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("jip-test-{name}-{}", std::process::id()))
+    }
+
     fn make_classes_dir(tmp: &Path, files: &[&str]) {
         let classes = tmp.join("target/classes");
         fs::create_dir_all(&classes).unwrap();
@@ -497,7 +501,7 @@ mod tests {
 
     #[test]
     fn thin_jar_contains_class_files() {
-        let tmp = std::env::temp_dir().join("jip-test-thin-jar");
+        let tmp = test_tmp("thin-jar");
         let _ = fs::remove_dir_all(&tmp);
         make_classes_dir(&tmp, &["com/example/App.class", "com/example/Util.class"]);
 
@@ -507,7 +511,7 @@ mod tests {
         let options =
             SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
-        let manifest = "Manifest-Version: 1.0\nMain-Class: com.example.App\n";
+        let manifest = "Manifest-Version: 1.0\r\nMain-Class: com.example.App\r\n";
         zip.start_file("META-INF/MANIFEST.MF", options).unwrap();
         zip.write_all(manifest.as_bytes()).unwrap();
 
@@ -539,7 +543,7 @@ mod tests {
 
     #[test]
     fn thin_jar_skips_duplicate_manifest() {
-        let tmp = std::env::temp_dir().join("jip-test-thin-dup");
+        let tmp = test_tmp("thin-dup");
         let _ = fs::remove_dir_all(&tmp);
         make_classes_dir(&tmp, &["com/example/App.class", "META-INF/MANIFEST.MF"]);
 
@@ -548,7 +552,7 @@ mod tests {
         let options =
             SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
-        let manifest = "Manifest-Version: 1.0\n";
+        let manifest = "Manifest-Version: 1.0\r\n";
         zip.start_file("META-INF/MANIFEST.MF", options).unwrap();
         zip.write_all(manifest.as_bytes()).unwrap();
 
@@ -578,7 +582,7 @@ mod tests {
 
     #[test]
     fn fat_jar_merges_dependency() {
-        let tmp = std::env::temp_dir().join("jip-test-fat-jar");
+        let tmp = test_tmp("fat-jar");
         let _ = fs::remove_dir_all(&tmp);
         make_classes_dir(&tmp, &["com/example/App.class"]);
 
@@ -593,7 +597,7 @@ mod tests {
             zip.start_file("com/lib/Helper.class", options).unwrap();
             zip.write_all(b"fake dep class").unwrap();
             zip.start_file("META-INF/MANIFEST.MF", options).unwrap();
-            zip.write_all(b"Manifest-Version: 1.0\n").unwrap();
+            zip.write_all(b"Manifest-Version: 1.0\r\n").unwrap();
             zip.finish().unwrap();
         }
 
@@ -605,7 +609,7 @@ mod tests {
 
         // Write our own manifest (like build_fat_jar does)
         zip.start_file("META-INF/MANIFEST.MF", options).unwrap();
-        zip.write_all(b"Manifest-Version: 1.0\nMain-Class: com.example.App\n")
+        zip.write_all(b"Manifest-Version: 1.0\r\nMain-Class: com.example.App\r\n")
             .unwrap();
 
         let mut seen = BTreeSet::new();
@@ -643,7 +647,7 @@ mod tests {
 
     #[test]
     fn fat_jar_warns_on_duplicate_resources() {
-        let tmp = std::env::temp_dir().join("jip-test-fat-dup");
+        let tmp = test_tmp("fat-dup");
         let _ = fs::remove_dir_all(&tmp);
         make_classes_dir(&tmp, &["com/example/App.class"]);
 
@@ -690,7 +694,7 @@ mod tests {
 
     #[test]
     fn fat_jar_skips_signature_and_metadata_files() {
-        let tmp = std::env::temp_dir().join("jip-test-fat-skip");
+        let tmp = test_tmp("fat-skip");
         let _ = fs::remove_dir_all(&tmp);
         make_classes_dir(&tmp, &["com/example/App.class"]);
 

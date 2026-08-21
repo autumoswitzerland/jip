@@ -443,13 +443,16 @@ fn java_binary() -> anyhow::Result<PathBuf> {
 pub fn javac_binary() -> anyhow::Result<PathBuf> {
     if let Some(active) = crate::jdk::ActiveConfig::load().ok().and_then(|c| c.active) {
         let base = crate::jdk::jdk_base()?;
-        let javac = base
-            .join(active.vendor.to_string())
-            .join(&active.version)
-            .join("bin")
-            .join("javac");
-        if javac.exists() {
-            return Ok(javac);
+        let jdk_dir = base.join(active.vendor.to_string()).join(&active.version);
+        let exe = crate::jdk::with_exe("javac");
+
+        let standard = jdk_dir.join("bin").join(&exe);
+        if standard.exists() {
+            return Ok(standard);
+        }
+        let macos = jdk_dir.join("Contents/Home/bin").join(&exe);
+        if macos.exists() {
+            return Ok(macos);
         }
     }
     which("javac")
@@ -462,12 +465,18 @@ fn which_java() -> anyhow::Result<PathBuf> {
 
 /// Find a binary on PATH.
 fn which(name: &str) -> anyhow::Result<PathBuf> {
-    let output = Command::new("which")
+    let cmd = if cfg!(windows) { "where" } else { "which" };
+    let output = Command::new(cmd)
         .arg(name)
         .output()
-        .with_context(|| format!("failed to run `which {name}`"))?;
+        .with_context(|| format!("failed to run `{cmd} {name}`"))?;
     if output.status.success() {
-        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let path = stdout
+            .lines()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty())
+            .context("command returned empty output")?;
         Ok(PathBuf::from(path))
     } else {
         bail!("`{name}` not found on PATH")

@@ -49,6 +49,15 @@ pub fn jdk_config_path() -> anyhow::Result<PathBuf> {
     Ok(home.join(".jip").join("jdk.toml"))
 }
 
+/// Append `.exe` on Windows, return the name unchanged on other platforms.
+pub fn with_exe(name: &str) -> String {
+    if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    }
+}
+
 /// Supported JDK vendors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -57,6 +66,7 @@ pub enum Vendor {
     Temurin,
     Corretto,
     Graalvm,
+    Liberica,
 }
 
 impl Vendor {
@@ -68,6 +78,7 @@ impl Vendor {
             Vendor::Temurin,
             Vendor::Corretto,
             Vendor::Graalvm,
+            Vendor::Liberica,
         ]
     }
 
@@ -79,17 +90,21 @@ impl Vendor {
             Vendor::Temurin => "Eclipse Temurin",
             Vendor::Corretto => "Amazon Corretto",
             Vendor::Graalvm => "GraalVM CE",
+            Vendor::Liberica => "BellSoft Liberica",
         }
     }
 
     /// Parse from a string (case-insensitive).
     pub fn from_str(s: &str) -> anyhow::Result<Self> {
         match s.to_lowercase().as_str() {
-            "zulu" => Ok(Vendor::Zulu),
+            "zulu" | "azul" => Ok(Vendor::Zulu),
             "temurin" | "adoptium" => Ok(Vendor::Temurin),
             "corretto" | "amazon" => Ok(Vendor::Corretto),
             "graalvm" | "graal" => Ok(Vendor::Graalvm),
-            _ => bail!("unknown vendor \"{s}\" — supported: zulu, temurin, corretto, graalvm"),
+            "liberica" | "bellsoft" => Ok(Vendor::Liberica),
+            _ => bail!(
+                "unknown vendor \"{s}\" — supported: zulu, temurin, corretto, graalvm, liberica"
+            ),
         }
     }
 }
@@ -101,6 +116,7 @@ impl std::fmt::Display for Vendor {
             Vendor::Temurin => write!(f, "temurin"),
             Vendor::Corretto => write!(f, "corretto"),
             Vendor::Graalvm => write!(f, "graalvm"),
+            Vendor::Liberica => write!(f, "liberica"),
         }
     }
 }
@@ -127,6 +143,11 @@ fn detect_arch() -> &'static str {
     } else {
         "x64"
     }
+}
+
+/// Archive extension: `.zip` on Windows, `.tar.gz` everywhere else.
+fn archive_ext() -> &'static str {
+    if cfg!(windows) { "zip" } else { "tar.gz" }
 }
 
 /// The optional per-vendor download URL override from `~/.jip/jdk.toml`
@@ -175,10 +196,12 @@ pub fn download_url(client: &Client, vendor: Vendor, version: &str) -> anyhow::R
                 _ => "linux",
             };
             Ok(format!(
-                "https://corretto.aws/downloads/latest/amazon-corretto-{version}-{arch}-{os_corretto}-jdk.tar.gz"
+                "https://corretto.aws/downloads/latest/amazon-corretto-{version}-{arch}-{os_corretto}-jdk.{}",
+                archive_ext()
             ))
         }
         Vendor::Graalvm => resolve_graalvm_url(client, version, os, arch),
+        Vendor::Liberica => resolve_liberica_url(client, version, os, arch),
     }
 }
 
@@ -205,7 +228,8 @@ fn resolve_zulu_url(
     };
 
     let api_url = format!(
-        "https://api.azul.com/metadata/v1/zulu/packages/?java_version={version}&os={os_azul}&arch={arch_azul}&archive_type=tar.gz&java_package_type=jdk&latest=true&release_status=ga"
+        "https://api.azul.com/metadata/v1/zulu/packages/?java_version={version}&os={os_azul}&arch={arch_azul}&archive_type={}&java_package_type=jdk&latest=true&release_status=ga",
+        archive_ext()
     );
 
     let resp = client
@@ -253,8 +277,9 @@ fn resolve_graalvm_url(
     };
 
     // 1) Try stable release: jdk-{version}
+    let ext = archive_ext();
     let stable_url = format!(
-        "https://github.com/graalvm/graalvm-ce-builds/releases/download/jdk-{version}/graalvm-community-jdk-{version}_{os_graal}-{arch}_bin.tar.gz"
+        "https://github.com/graalvm/graalvm-ce-builds/releases/download/jdk-{version}/graalvm-community-jdk-{version}_{os_graal}-{arch}_bin.{ext}"
     );
     if let Ok(r) = client.head(&stable_url).send()
         && r.status().is_success()
@@ -281,7 +306,7 @@ fn resolve_graalvm_url(
 
     let prefix_stable = format!("jdk-{version}.");
     let prefix_innovation = format!("graal-{version}.");
-    let suffix = format!("_{os_graal}-{arch}_bin.tar.gz");
+    let suffix = format!("_{os_graal}-{arch}_bin.{}", archive_ext());
 
     // Collect all matching URLs, then pick the first (newest — API returns newest first)
     let mut candidates = Vec::new();
@@ -310,6 +335,46 @@ fn resolve_graalvm_url(
     bail!(
         "GraalVM CE {version} is not available for {os}/{arch} — check https://github.com/graalvm/graalvm-ce-builds/releases"
     )
+}
+
+/// Resolve Liberica JDK download URL via the BellSoft Product Discovery API.
+fn resolve_liberica_url(
+    client: &Client,
+    version: &str,
+    os: &str,
+    arch: &str,
+) -> anyhow::Result<String> {
+    // BellSoft uses `x86` for x86_64 and `arm` for aarch64.
+    let arch_bell = match arch {
+        "x64" => "x86",
+        "aarch64" => "arm",
+        _ => arch,
+    };
+    let ext = archive_ext();
+    let api_url = format!(
+        "https://api.bell-sw.com/v1/liberica/releases?version-feature={version}&bitness=64&os={os}&arch={arch_bell}&package-type={ext}&bundle-type=jdk&version-modifier=latest"
+    );
+
+    let resp = client
+        .get(&api_url)
+        .send()
+        .context("failed to query BellSoft Product Discovery API")?;
+
+    if !resp.status().is_success() {
+        bail!("BellSoft API returned HTTP {}", resp.status());
+    }
+
+    let packages: Vec<serde_json::Value> =
+        resp.json().context("cannot parse BellSoft API response")?;
+
+    let pkg = packages
+        .first()
+        .context("no Liberica JDK found for this version and platform")?;
+
+    pkg["downloadUrl"]
+        .as_str()
+        .map(|s| s.to_string())
+        .context("BellSoft API response missing downloadUrl")
 }
 
 /// Active JDK configuration (stored in `~/.jip/jdk.toml`).
@@ -415,6 +480,71 @@ pub fn list_installed() -> anyhow::Result<Vec<JdkInstallation>> {
     Ok(installations)
 }
 
+/// Extract a `.tar.gz` or `.zip` archive into `target_dir`, stripping the
+/// first path component (JDK tarballs/zipfiles contain a single top-level dir).
+fn extract_archive(archive: &Path, target_dir: &Path) -> anyhow::Result<()> {
+    let stem = archive.file_name().and_then(|s| s.to_str()).unwrap_or("");
+
+    if stem.ends_with(".tar.gz") {
+        let file = fs::File::open(archive)?;
+        let dec = flate2::read::GzDecoder::new(file);
+        let mut ar = tar::Archive::new(dec);
+        ar.set_overwrite(true);
+        for entry in ar.entries()? {
+            let mut entry = entry?;
+            let path = entry.path()?;
+            let stripped = path
+                .strip_prefix(
+                    path.components()
+                        .next()
+                        .map(|c| c.as_os_str())
+                        .unwrap_or(std::ffi::OsStr::new("")),
+                )
+                .unwrap_or(&path);
+            if stripped.as_os_str().is_empty() {
+                continue;
+            }
+            let out = target_dir.join(stripped);
+            if let Some(parent) = out.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            entry.unpack(&out)?;
+        }
+    } else if stem.ends_with(".zip") {
+        let file = fs::File::open(archive)?;
+        let mut zip = zip::ZipArchive::new(file).context("cannot open zip archive")?;
+        for i in 0..zip.len() {
+            let mut entry = zip.by_index(i)?;
+            let path = entry.mangled_name();
+            let stripped = path
+                .strip_prefix(
+                    path.components()
+                        .next()
+                        .map(|c| c.as_os_str())
+                        .unwrap_or(std::ffi::OsStr::new("")),
+                )
+                .unwrap_or(&path);
+            if stripped.as_os_str().is_empty() {
+                continue;
+            }
+            let out = target_dir.join(stripped);
+            if entry.is_dir() {
+                fs::create_dir_all(&out)?;
+            } else {
+                if let Some(parent) = out.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                let mut f = fs::File::create(&out)?;
+                std::io::copy(&mut entry, &mut f)?;
+            }
+        }
+    } else {
+        bail!("unsupported archive format: {}", archive.display());
+    }
+
+    Ok(())
+}
+
 /// Install a JDK by downloading and extracting it.
 pub fn install(client: &Client, vendor: Vendor, version: &str) -> anyhow::Result<PathBuf> {
     let base = jdk_base()?;
@@ -433,7 +563,7 @@ pub fn install(client: &Client, vendor: Vendor, version: &str) -> anyhow::Result
 
     let tmp_dir = base.join(".tmp");
     fs::create_dir_all(&tmp_dir)?;
-    let tar_path = tmp_dir.join(format!("{vendor}-{version}.tar.gz"));
+    let archive_path = tmp_dir.join(format!("{vendor}-{version}.{}", archive_ext()));
 
     // Separate client with longer timeout for large JDK downloads (~200MB).
     let mut builder = Client::builder()
@@ -470,29 +600,17 @@ pub fn install(client: &Client, vendor: Vendor, version: &str) -> anyhow::Result
         bail!("download failed: HTTP {} from {url}", response.status());
     }
 
-    let mut file = fs::File::create(&tar_path)?;
+    let mut file = fs::File::create(&archive_path)?;
     std::io::copy(&mut response, &mut file)?;
     drop(file);
 
     println!("extracting...");
     fs::create_dir_all(&target_dir)?;
 
-    let output = Command::new("tar")
-        .arg("xzf")
-        .arg(&tar_path)
-        .arg("-C")
-        .arg(&target_dir)
-        .arg("--strip-components=1")
-        .output()
-        .context("failed to run tar — is it installed?")?;
+    extract_archive(&archive_path, &target_dir)
+        .with_context(|| format!("extraction failed for {}", archive_path.display()))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        fs::remove_dir_all(&target_dir).ok();
-        bail!("extraction failed: {stderr}");
-    }
-
-    fs::remove_file(&tar_path).ok();
+    fs::remove_file(&archive_path).ok();
     fs::remove_dir(&tmp_dir).ok();
 
     println!(
@@ -593,22 +711,27 @@ pub fn active_java() -> anyhow::Result<PathBuf> {
         .context("no active JDK set — run `jip java use <version>` first")?;
 
     let base = jdk_base()?;
-    let java_path = base
-        .join(active.vendor.to_string())
-        .join(&active.version)
-        .join("bin")
-        .join("java");
+    let jdk_dir = base.join(active.vendor.to_string()).join(&active.version);
+    let exe = with_exe("java");
 
-    if !java_path.exists() {
-        bail!(
-            "active JDK {} {} not found at {}",
-            active.vendor,
-            active.version,
-            java_path.display()
-        );
+    // Standard layout: bin/java
+    let standard = jdk_dir.join("bin").join(&exe);
+    if standard.exists() {
+        return Ok(standard);
     }
 
-    Ok(java_path)
+    // macOS layout: Contents/Home/bin/java
+    let macos = jdk_dir.join("Contents/Home/bin").join(&exe);
+    if macos.exists() {
+        return Ok(macos);
+    }
+
+    bail!(
+        "active JDK {} {} not found at {}",
+        active.vendor,
+        active.version,
+        jdk_dir.display()
+    )
 }
 
 /// Detect the Java major version from a `java` binary.
@@ -643,12 +766,15 @@ mod tests {
     #[test]
     fn vendor_from_str() {
         assert_eq!(Vendor::from_str("zulu").unwrap(), Vendor::Zulu);
+        assert_eq!(Vendor::from_str("azul").unwrap(), Vendor::Zulu);
         assert_eq!(Vendor::from_str("temurin").unwrap(), Vendor::Temurin);
         assert_eq!(Vendor::from_str("adoptium").unwrap(), Vendor::Temurin);
         assert_eq!(Vendor::from_str("corretto").unwrap(), Vendor::Corretto);
         assert_eq!(Vendor::from_str("amazon").unwrap(), Vendor::Corretto);
         assert_eq!(Vendor::from_str("graalvm").unwrap(), Vendor::Graalvm);
         assert_eq!(Vendor::from_str("graal").unwrap(), Vendor::Graalvm);
+        assert_eq!(Vendor::from_str("liberica").unwrap(), Vendor::Liberica);
+        assert_eq!(Vendor::from_str("bellsoft").unwrap(), Vendor::Liberica);
         assert!(Vendor::from_str("oracle").is_err());
     }
 
@@ -667,7 +793,7 @@ mod tests {
         let client = reqwest::blocking::Client::new();
         let url = download_url(&client, Vendor::Corretto, "21").unwrap();
         assert!(url.contains("amazon-corretto-21-"));
-        assert!(url.ends_with("-jdk.tar.gz"));
+        assert!(url.ends_with("-jdk.tar.gz") || url.ends_with("-jdk.zip"));
     }
 
     #[test]
@@ -680,6 +806,22 @@ mod tests {
         );
         assert!(expected.contains("graalvm-community-jdk-21_"));
         assert!(expected.ends_with("_bin.tar.gz"));
+    }
+
+    #[test]
+    fn liberica_url_pattern() {
+        let os = detect_os();
+        let arch_bell = match detect_arch() {
+            "x64" => "x86",
+            "aarch64" => "arm",
+            other => other,
+        };
+        let ext = archive_ext();
+        let expected = format!(
+            "https://api.bell-sw.com/v1/liberica/releases?version-feature=21&bitness=64&os={os}&arch={arch_bell}&package-type={ext}&bundle-type=jdk&version-modifier=latest"
+        );
+        assert!(expected.contains("bell-sw.com"));
+        assert!(expected.contains("version-feature=21"));
     }
 
     use std::sync::Mutex;
@@ -755,7 +897,11 @@ mod tests {
     fn active_java_returns_path_when_jdk_exists() {
         let _lock = ACTIVE_MUTEX.lock().unwrap();
         let base = jdk_base().unwrap();
-        let fake_java = base.join("zulu").join("21").join("bin").join("java");
+        let fake_java = base
+            .join("zulu")
+            .join("21")
+            .join("bin")
+            .join(with_exe("java"));
         if let Some(parent) = fake_java.parent() {
             fs::create_dir_all(parent).unwrap();
         }
@@ -772,7 +918,11 @@ mod tests {
 
         let result = active_java();
         let path = result.unwrap();
-        assert!(path.to_string_lossy().contains("zulu/21/bin/java"));
+        let expected = Path::new("zulu")
+            .join("21")
+            .join("bin")
+            .join(with_exe("java"));
+        assert!(path.ends_with(expected));
 
         let _ = fs::remove_dir_all(base.join("zulu").join("21"));
         ActiveConfig {

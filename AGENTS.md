@@ -32,6 +32,12 @@ on this host; Java 21 Zulu at `/usr/bin/java` (includes `javac`).
 
 ## Conventions
 
+- **Cross-platform first:** jip must work identically on macOS, Linux, and Windows.
+  Never use hardcoded `/` or `\` in path construction — always use `Path::join` /
+  `PathBuf`. Never shell out to platform-specific commands (`tar`, `which`, `rm`)
+  when a Rust crate exists. Check `cfg!(windows)` for OS-specific behavior (`.exe`
+  suffixes, archive formats, path separators, ANSI support). All tests must pass
+  on all three platforms.
 - No code comments unless asked. Header/banner style follows the AGPL header +
   section banner used across `src/` (any file header is the model).
 - `jip.toml` in project, `jip.lock` pinned/committed. Never `publish`.
@@ -105,5 +111,6 @@ on this host; Java 21 Zulu at `/usr/bin/java` (includes `javac`).
 | **Eclipse Temurin** | `https://api.adoptium.net/v3/binary/latest/{version}/ga/{os}/{arch}/jdk/hotspot/normal/eclipse` |
 | **Amazon Corretto** | `https://corretto.aws/downloads/latest/amazon-corretto-{version}-{arch}-{os}-jdk.tar.gz` |
 | **GraalVM CE** | `https://github.com/graalvm/graalvm-ce-builds/releases/download/jdk-{version}/graalvm-jdk-{version}_{os}-{arch}.tar.gz` |
+| **BellSoft Liberica** | Product Discovery API: `https://api.bell-sw.com/v1/liberica/releases?version-feature={version}&bitness=64&os={os}&arch={arch}&package-type=tar.gz&bundle-type=jdk&version-modifier=latest` (arch: `x86`=x64, `arm`=aarch64) |
 
 Custom vendor URLs: `~/.jip/jdk.toml` (key = vendor name, value = URL template with `{version}`, `{arch}`, `{os}` placeholders). Oracle JDK excluded (login required).

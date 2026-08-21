@@ -91,9 +91,14 @@ pub fn run(
     {
         "Gradle"
     } else {
+        let remove_cmd = if cfg!(windows) {
+            format!("rmdir /s /q {name}")
+        } else {
+            format!("rm -rf {name}")
+        };
         bail!(
             "./{name} is not a Maven or Gradle project — there is nothing to \
-             convert.  Remove the directory with `rm -rf {name}` if it is \
+             convert.  Remove the directory with `{remove_cmd}` if it is \
              not needed"
         );
     };
@@ -119,8 +124,8 @@ pub fn run(
 /// Handles `https://`/`ssh://` URLs as well as SCP-style `git@host:org/repo`
 /// ones, stripping a trailing `.git` and any trailing slashes.
 fn repo_name(url: &str) -> String {
-    let trimmed = url.trim_end_matches('/');
-    let base = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    let trimmed = url.trim_end_matches('/').trim_end_matches('\\');
+    let base = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
     base.strip_suffix(".git").unwrap_or(base).to_string()
 }
 

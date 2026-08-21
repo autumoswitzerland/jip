@@ -368,6 +368,27 @@ fn collect_scope(
     result
 }
 
+/// Convert a native absolute directory path into URL form: forward slashes,
+/// and a leading slash for drive-letter paths (`C:/x` -> `/C:/x`) so a
+/// `file://` prefix yields a valid `file:///C:/x` URL on Windows.
+fn url_path(dir: &str) -> String {
+    use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+    // Keep path structure intact: `/`, `:`, `@`, `.`, `-`, `_`, `~`
+    const FILE_PATH: &AsciiSet = &NON_ALPHANUMERIC
+        .remove(b'/')
+        .remove(b':')
+        .remove(b'@')
+        .remove(b'.')
+        .remove(b'-')
+        .remove(b'_')
+        .remove(b'~');
+    let mut url = dir.replace('\\', "/");
+    if url.len() >= 3 && url.as_bytes()[1] == b':' {
+        url.insert(0, '/');
+    }
+    utf8_percent_encode(&url, FILE_PATH).to_string()
+}
+
 /// Convert the custom `<repositories>` of a Maven project, resolving the
 /// built-in `${project.basedir}` property (and any POM property that builds
 /// on it) against the directory jip is running in.
@@ -375,7 +396,7 @@ pub fn maven_repositories_from_xml(pom: &Pom) -> BTreeMap<String, String> {
     let (mut properties, _) = maven_context(pom);
     let basedir = std::env::current_dir()
         .ok()
-        .map(|dir| dir.to_string_lossy().into_owned())
+        .map(|dir| url_path(&dir.to_string_lossy()))
         .unwrap_or_default();
     properties.insert("project.basedir".to_string(), basedir.clone());
     properties.insert("basedir".to_string(), basedir);
@@ -822,7 +843,7 @@ pub fn gradle_repositories_from_content(content: &str) -> BTreeMap<String, Strin
 
     let basedir = std::env::current_dir()
         .ok()
-        .map(|dir| dir.to_string_lossy().into_owned())
+        .map(|dir| url_path(&dir.to_string_lossy()))
         .unwrap_or_default();
 
     let resolve = |url: &str| -> String {
@@ -935,7 +956,7 @@ pub fn gradle_subprojects_deps(
 
     let basedir = std::env::current_dir()
         .ok()
-        .map(|dir| dir.to_string_lossy().into_owned())
+        .map(|dir| url_path(&dir.to_string_lossy()))
         .unwrap_or_default();
     let resolve_url = |url: &str| -> String {
         let url = url.replace("$projectDir", &basedir);
@@ -2004,7 +2025,7 @@ mod tests {
         assert_eq!(repos.len(), 1);
         let expected = format!(
             "{}/lib/repo",
-            std::env::current_dir().unwrap().to_string_lossy()
+            url_path(&std::env::current_dir().unwrap().to_string_lossy())
         );
         let url = &repos[&expected];
         assert!(url.starts_with("/"));

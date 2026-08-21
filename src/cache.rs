@@ -136,7 +136,11 @@ impl Cache {
             let src = base_dir.join(&jar_path);
             let bytes = fs::read(&src)
                 .with_context(|| format!("jar not found in local repository {src:?}"))?;
-            let expected = fs::read_to_string(format!("{}.sha1", src.display())).ok();
+            let sha1_name = format!(
+                "{}.sha1",
+                src.file_name().and_then(|f| f.to_str()).unwrap_or("")
+            );
+            let expected = fs::read_to_string(src.parent().unwrap_or(&src).join(sha1_name)).ok();
             let jar_url = format!("{repo}/{jar_path}");
             return self.write_cached(artifact, &bytes, expected.as_deref(), &jar_url);
         }
@@ -227,13 +231,8 @@ fn default_cache_root() -> PathBuf {
 }
 
 /// The user's home directory, on any operating system.
-///
-/// Windows uses `USERPROFILE` instead of `HOME`; Unix systems use `HOME`.
 fn home_dir() -> PathBuf {
-    let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-    std::env::var(home_var)
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir())
+    dirs::home_dir().unwrap_or_else(std::env::temp_dir)
 }
 
 /// Download a small text file (such as a POM) from a repository.
@@ -281,20 +280,22 @@ fn ensure_repo_dir(base_dir: &Path) -> anyhow::Result<()> {
 
 /// The filesystem path behind a `file://` URL, or `None` for HTTP URLs.
 pub(crate) fn file_url_path(repo: &str) -> Option<PathBuf> {
+    use percent_encoding::percent_decode_str;
     let rest = repo.strip_prefix("file://")?;
     let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    let decoded = percent_decode_str(rest).decode_utf8_lossy().to_string();
     // `file:///C:/path` -> `C:/path` on Windows.
     if cfg!(windows) {
-        let bytes = rest.as_bytes();
-        if rest.starts_with('/')
-            && rest.len() > 2
+        let bytes = decoded.as_bytes();
+        if decoded.starts_with('/')
+            && decoded.len() > 2
             && bytes[1].is_ascii_alphabetic()
             && bytes[2] == b':'
         {
-            return Some(PathBuf::from(&rest[1..]));
+            return Some(PathBuf::from(&decoded[1..]));
         }
     }
-    Some(PathBuf::from(rest))
+    Some(PathBuf::from(decoded))
 }
 
 #[cfg(test)]

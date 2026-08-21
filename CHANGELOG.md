@@ -5,6 +5,68 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-08-21
+
+### Added
+
+- BellSoft Liberica JDK as a fifth vendor: `jip java install 21 --vendor liberica`
+  (aliases: `bellsoft`). Uses the BellSoft Product Discovery API for URL resolution.
+  Arch mapping: `x86` = x64, `arm` = aarch64.
+- Vendor name aliases for convenience: `--vendor azul` (Zulu),
+  `--vendor amazon` (Corretto), `--vendor bellsoft` (Liberica).
+- Cross-platform audit: AGENTS.md now documents the "cross-platform first"
+  convention as a core project principle.
+
+### Fixed
+
+- **Gradle nested module dependencies** (`multi.rs`): `project(':lib:core')`
+  references now correctly resolve to `lib/core` (Unix) / `lib\core` (Windows)
+  instead of being silently skipped. Fixes build order and classpath for
+  nested Gradle modules on all platforms.
+- **JDK binary lookup on Windows** (`jdk.rs`, `mod.rs`): `java` / `javac`
+  paths now append `.exe` on Windows via `with_exe()`. Without this, an
+  installed and activated JDK was reported as "not found" because
+  `bin/java` does not exist on NTFS — only `bin/java.exe`.
+- **JDK install on Windows** (`jdk.rs`): replaced external `tar` command
+  with pure-Rust extraction (`tar` + `flate2` for `.tar.gz`, existing `zip`
+  crate for `.zip`). Vendor download URLs now return `.zip` on Windows
+  (Corretto, Zulu API, GraalVM) instead of `.tar.gz` which 404'd.
+- **`jip get` error message** (`get.rs`): platform-aware removal suggestion
+  — `rm -rf` on Unix, `rmdir /s /q` on Windows.
+- **`which()` output on Windows** (`mod.rs`): Windows `where` returns all
+  matches (one per line); now only the first non-empty line is used.
+- **ANSI colors on Windows** (`console.rs`): enables
+  `ENABLE_VIRTUAL_TERMINAL_PROCESSING` via `enable-ansi-support` crate so
+  legacy conhost renders colors correctly instead of showing escape codes.
+- **`file://` repository URLs** (`convert.rs`, `cache.rs`): paths with
+  spaces are now percent-encoded when building URLs and decoded when parsing
+  them, preventing malformed `file:///path with spaces/...` URLs.
+- **`home_dir()` consistency** (`cache.rs`): replaced hand-rolled
+  `HOME`/`USERPROFILE` lookup with `dirs::home_dir()` to match the rest of
+  the codebase.
+- **Module build-file paths** (`multi.rs`): Gradle inter-module dependency
+  scanning now uses `Path::join` instead of hardcoded `/` separators.
+- **`.sha1` local repo lookup** (`cache.rs`): uses `Path` operations
+  instead of `format!("{}.sha1", src.display())`.
+- **Test temp directory collisions** (`jar.rs`): fixed-name temp dirs now
+  include the process ID to prevent failures under concurrent `cargo test`.
+- **Symlink recursion** (`build.rs`): `walk()` now uses `entry.file_type()`
+  (no symlink traversal) instead of `path.is_dir()` which follows symlinks,
+  preventing infinite recursion on cyclic links.
+- **JAR manifest line endings** (`jar.rs`): manifest now writes `\r\n`
+  per JAR specification instead of `\n`.
+- **`repo_name()` Windows paths** (`get.rs`): handles backslash separators
+  in local path input.
+- **macOS JDK lookup** (`jdk.rs`, `mod.rs`): `active_java()` and
+  `javac_binary()` now check `Contents/Home/bin/` as a fallback when
+  `bin/java` does not exist. macOS JDK tarballs (Zulu, Liberica, etc.)
+  extract to `<vendor>/<version>/Contents/Home/bin/java` instead of
+  `<vendor>/<version>/bin/java`; without this fix the active JDK was
+  silently ignored and the system `java` on PATH was used instead.
+- **`jip clean` multi-module** (`clean.rs`): now removes `target/`
+  directories in all sub-modules listed in `[modules]`, not just the
+  root `target/`.
+
 ## [1.0.0] - 2026-08-18
 
 ### Added
@@ -68,7 +130,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `jip java install <version> [--vendor <name>]` — download and install a JDK.
   - `jip java use <version> [--vendor <name>]` — set the active JDK.
   - `jip java remove <version> [--vendor <name>]` — remove an installed JDK.
-  - Supported vendors: `zulu` (default), `temurin`, `corretto`, `graalvm`.
+  - Supported vendors: `zulu` (default), `temurin`, `corretto`, `graalvm`,
+    `liberica`.
 - `jip java remove` clears the active JDK config when the last installed
   JDK is removed, falling back to the system `java` on PATH.
 - Optional per-vendor download URL overrides in `~/.jip/jdk.toml`
@@ -151,4 +214,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     statements) warn that jip cannot detect them and converted the project
     as a single module.
 
+[1.1.0]: https://github.com/autumoswitzerland/jip/releases/tag/v1.1.0
 [1.0.0]: https://github.com/autumoswitzerland/jip/releases/tag/v1.0.0

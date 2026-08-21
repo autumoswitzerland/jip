@@ -403,11 +403,13 @@ fn walk(dir: &Path, files: &mut Vec<PathBuf>) {
         return;
     };
     for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            walk(&path, files);
-        } else {
-            files.push(path);
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_dir() {
+            walk(&entry.path(), files);
+        } else if ft.is_file() {
+            files.push(entry.path());
         }
     }
 }

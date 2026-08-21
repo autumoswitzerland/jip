@@ -212,7 +212,7 @@ pub enum JavaCommand {
     Install {
         /// JDK major version to install (e.g. "21").
         version: String,
-        /// Vendor to install from: zulu, temurin, corretto, graalvm.
+        /// Vendor to install from: zulu, temurin, corretto, graalvm, liberica.
         #[arg(long)]
         vendor: Option<String>,
     },

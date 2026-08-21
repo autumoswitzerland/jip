@@ -42,7 +42,12 @@ fn enabled() -> bool {
         if std::env::var_os("TERM").is_some_and(|term| term == "dumb") {
             return false;
         }
-        std::io::stdout().is_terminal() && std::io::stderr().is_terminal()
+        let terminal = std::io::stdout().is_terminal() && std::io::stderr().is_terminal();
+        if terminal {
+            #[cfg(windows)]
+            let _ = enable_ansi_support::enable_ansi_support();
+        }
+        terminal
     })
 }
 

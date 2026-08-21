@@ -391,7 +391,8 @@ fn parse_gradle_modules(content: &str) -> Vec<String> {
             let item = item.trim().trim_matches('\'').trim_matches('"');
             let item = item.trim_start_matches(':');
             if !item.is_empty() {
-                modules.push(item.replace('/', std::path::MAIN_SEPARATOR_STR));
+                let path = item.replace(':', std::path::MAIN_SEPARATOR_STR);
+                modules.push(path);
             }
         }
     }
@@ -405,10 +406,12 @@ fn parse_gradle_modules(content: &str) -> Vec<String> {
 /// Reads the module's `build.gradle(.kts)` and looks for `project(':...')`
 /// references.
 fn collect_gradle_inter_module_deps(module_name: &str) -> Vec<String> {
-    let build_file = if Path::new(&format!("{module_name}/build.gradle.kts")).exists() {
-        format!("{module_name}/build.gradle.kts")
-    } else if Path::new(&format!("{module_name}/build.gradle")).exists() {
-        format!("{module_name}/build.gradle")
+    let kts = Path::new(module_name).join("build.gradle.kts");
+    let groovy = Path::new(module_name).join("build.gradle");
+    let build_file = if kts.exists() {
+        kts
+    } else if groovy.exists() {
+        groovy
     } else {
         return Vec::new();
     };
@@ -424,7 +427,7 @@ fn collect_gradle_inter_module_deps(module_name: &str) -> Vec<String> {
             let dep = cap
                 .get(1)?
                 .as_str()
-                .replace('/', std::path::MAIN_SEPARATOR_STR);
+                .replace(':', std::path::MAIN_SEPARATOR_STR);
             Some(dep)
         })
         .collect()
@@ -589,7 +592,11 @@ mod tests {
     fn parse_gradle_include_parens() {
         let settings = r#"include("lib:core", "lib:api")"#;
         let modules = parse_gradle_modules(settings);
-        assert_eq!(modules, vec!["lib:api", "lib:core"]);
+        let sep = std::path::MAIN_SEPARATOR_STR;
+        assert_eq!(
+            modules,
+            vec![format!("lib{sep}api"), format!("lib{sep}core")]
+        );
     }
 
     #[test]

@@ -25,9 +25,7 @@
 name: CI
 
 on:
-  push:
-    branches: [master]
-  pull_request:
+  workflow_dispatch:
 
 jobs:
   # Build and test natively on macOS, Linux, and Windows.

@@ -29,20 +29,42 @@ use anyhow::{Context, bail};
 /// Remove the `target/` build directory.
 pub fn run() -> anyhow::Result<()> {
     let target = Path::new("target");
-    if !target.exists() {
-        println!("nothing to clean — no target/ directory");
-        return Ok(());
+    let had_root = target.exists();
+    if had_root {
+        if !target.is_dir() {
+            bail!(
+                "{} is not a directory — refusing to remove it",
+                target.display()
+            );
+        }
+        fs::remove_dir_all(target)
+            .with_context(|| format!("cannot remove {}", target.display()))?;
     }
-    if !target.is_dir() {
-        bail!(
-            "{} is not a directory — refusing to remove it",
-            target.display()
+
+    if let Ok(config) = crate::config::ProjectConfig::load(Path::new("jip.toml"))
+        && let Some(modules) = &config.modules
+    {
+        for path in modules.modules.values() {
+            let module_target = Path::new(path).join("target");
+            if module_target.exists() {
+                fs::remove_dir_all(&module_target)
+                    .with_context(|| format!("cannot remove {}", module_target.display()))?;
+                println!(
+                    "{}",
+                    crate::console::green(&format!("removed {path}/target/"))
+                );
+            }
+        }
+    }
+
+    if had_root {
+        println!(
+            "{}",
+            crate::console::green("removed target/ build artifacts")
         );
     }
-    fs::remove_dir_all(target).with_context(|| format!("cannot remove {}", target.display()))?;
-    println!(
-        "{}",
-        crate::console::green("removed target/ build artifacts")
-    );
+    if !had_root {
+        println!("nothing to clean — no target/ directory");
+    }
     Ok(())
 }

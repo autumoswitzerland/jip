@@ -8,7 +8,7 @@
   Clone a project, run it — jip handles dependencies, compilation, and execution
   in a single binary with a single slim config file.
 
-  <img src="https://img.shields.io/badge/version-1.0.0-FFD54F">
+  <img src="https://img.shields.io/badge/version-1.1.0-FFD54F">
   <img src="https://img.shields.io/badge/license-AGPLv3-orange">
   <img src="https://img.shields.io/badge/rust-2024-blue">
 
@@ -293,7 +293,7 @@ jip java remove 21                         # remove installed JDK 21
 jip java remove 21 --vendor temurin        # remove specific vendor's JDK 21
 ```
 
-Supported vendors: `zulu` (Azul Zulu, default), `temurin` (Eclipse Temurin), `corretto` (Amazon Corretto), `graalvm` (GraalVM CE).
+Supported vendors: `zulu` (Azul Zulu, default), `temurin` (Eclipse Temurin), `corretto` (Amazon Corretto), `graalvm` (GraalVM CE), `liberica` (BellSoft Liberica).
 
 JDKs are stored in `~/.jip/jdks/{vendor}/{version}/`. The active JDK is tracked in `~/.jip/jdk.toml`.
 
@@ -317,6 +317,11 @@ temurin = "https://api.adoptium.net/v3/binary/latest/{version}/ga/mac/{arch}/jdk
 
 corretto = "https://corretto.aws/downloads/latest/amazon-corretto-{version}-{arch}-{os}-jdk.tar.gz"
 graalvm = "https://github.com/graalvm/graalvm-ce-builds/releases/download/jdk-{version}/graalvm-jdk-{version}_{os}-{arch}.tar.gz"
+
+# BellSoft Liberica — resolved via the Product Discovery API, arch uses
+# `x86` for x64 and `arm` for aarch64 (BellSoft naming):
+#   https://api.bell-sw.com/v1/liberica/releases?version-feature={version}&bitness=64&os={os}&arch={arch}&package-type=tar.gz&bundle-type=jdk&version-modifier=latest
+liberica = "https://cdn.example/liberica-jdk-{version}-{os}-{arch}.tar.gz"
 ```
 
 When the active JDK is removed and other JDKs are still installed, `jip` requires switching to another version first. When the last JDK is removed, the active config is cleared and `jip build`/`run`/`test` fall back to the system `java` on PATH.
